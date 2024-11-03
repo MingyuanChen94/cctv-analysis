@@ -1,8 +1,8 @@
-# CCTV Analysis System - Project Structure
+# CCTV Analysis Package - Project Structure
 
 ## Overview
 
-The CCTV Analysis System is organized as follows:
+The CCTV Analysis Package is organized as follows:
 
 ```plaintext
 cctv-analysis/

@@ -84,16 +84,20 @@ This system is designed with privacy in mind
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## Project Structure
+
+- [[structure|Project Structure]]
+
 ## Citation
 
 If you use this project in your research, please cite:
 
 ```bibtex
 @software{cctv_analysis_2024,
-  author = {Your Name},
-  title = {CCTV Analysis System},
+  author = {Mingyuan Chen},
+  title = {CCTV Analysis},
   year = {2024},
   publisher = {GitHub},
-  url = {https://github.com/yourusername/cctv-analysis}
+  url = {https://github.com/MingyuanChen94/cctv-analysis}
 }
 ```
