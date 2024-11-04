@@ -49,11 +49,12 @@ pip install -r requirements.txt
 2. Run the analysis
 
 ```python
+import os
 from cctv_analysis.camera_processor import process_surveillance_footage
 
 results = process_surveillance_footage(
-    camera1_path='path/to/camera1/footage.mp4',
-    camera2_path='path/to/camera2/footage.mp4'
+    camera1_path=os.path.join("data","raw","camera1"),
+    camera2_path=os.path.join("data","raw","camera1")
 )
 ```
 
