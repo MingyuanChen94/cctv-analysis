@@ -11,36 +11,58 @@ A comprehensive system for analyzing CCTV footage to track individuals across mu
 - Privacy-focused data handling
 - Configurable processing pipeline
 
-## Requirements
+## Project Structure
 
-- Python 3.8+
-- OpenCV 4.5+
-- DeepFace
-- NumPy
-- Pandas
-- PyYAML
+```plaintext
+cctv-analysis/
+│
+├── src/                      # Source code directory
+│   └── cctv_analysis/       # Main package directory
+│       ├── camera_processor.py
+│       ├── person_tracker.py
+│       └── utils/
+│
+├── data/                     # Data directory
+│   └── videos/              # Input video files
+│
+├── output/                   # Output directory
+│   ├── tracks/             # Tracking results
+│   └── analysis/           # Analysis results
+│
+├── notebooks/               # Jupyter notebooks
+│   └── cctv_analysis.ipynb      # Main analysis notebook
+│
+├── environment.yml          # Conda environment file
+├── README.md               # This file
+└── logs/                    # Log files directory
+```
+
+## Prerequisites
+
+- Anaconda or Miniconda
+- CUDA-capable GPU (recommended)
+- Git
 
 ## Installation
 
-1. Clone the repository
+1. Clone the repository:
+   
+    ```bash
+    git clone https://github.com/MingyuanChen94/cctv-analysis.git
+    cd cctv-analysis
+    ```
 
-```bash
-git clone https://github.com/yourusername/cctv-analysis.git
-cd cctv-analysis
-```
+1. Create and activate the conda environment:
+   
+    ```bash
+    conda env create -f environment.yml
+    conda activate cctv-analysis
+    ```
 
-2. Create a virtual environment (recommended)
+2. Verify the installation:
 
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
+    ```python
+    ```
 
 ## Usage
 
@@ -54,7 +76,7 @@ from cctv_analysis.camera_processor import process_surveillance_footage
 
 results = process_surveillance_footage(
     camera1_path=os.path.join("data","raw","camera1"),
-    camera2_path=os.path.join("data","raw","camera1")
+    camera2_path=os.path.join("data","raw","camera2")
 )
 ```
 
@@ -81,13 +103,17 @@ This system is designed with privacy in mind
 4. Push to the branch
 5. Create a Pull Request
 
+## Future Improvements
+
+- [ ] Add support for real-time processing
+- [ ] Implement multiple camera support (>2)
+- [ ] Add GUI for parameter tuning
+- [ ] Improve matching accuracy
+- [ ] Add export to various formats
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Project Structure
-
-- [[structure|Project Structure]]
 
 ## Citation
 

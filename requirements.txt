@@ -29,3 +29,5 @@ torch>=1.9.0
 torchvision>=0.10.0
 torchreid>=0.2.5
 yolo>=0.1.0
+yolox>=0.1.0
+insightface>=0.1.0
