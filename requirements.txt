@@ -5,6 +5,10 @@ isort>=5.9.0
 jinja2>=3.0.0
 matplotlib>=3.3.0
 mypy>=0.910
+ipykernel>=6.0.0
+jupyter>=1.0.0
+jupyterlab>=3.0.0
+
 # Core dependencies
 numpy>=1.19.0
 opencv-python>=4.5.0
@@ -23,3 +27,5 @@ scipy>=1.7.0
 seaborn>=0.11.0
 torch>=1.9.0
 torchvision>=0.10.0
+torchreid>=0.2.5
+yolo>=0.1.0
