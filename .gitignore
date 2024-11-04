@@ -47,3 +47,6 @@ config/local_config.yaml
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Model Weights
+*.pth
