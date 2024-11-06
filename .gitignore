@@ -37,8 +37,6 @@ env/
 *.avi
 *.mov
 *.mkv
-processed_data/
-raw_footage/
 *.log
 *.csv
 *.json
