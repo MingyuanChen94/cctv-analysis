@@ -1,182 +1,135 @@
-import datetime
-import logging
-from typing import Dict, List, Optional, Tuple
-
 import cv2
+import torch
 import numpy as np
-import pandas as pd
-from deepface import DeepFace
+from pathlib import Path
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from tqdm import tqdm
 
-from .demographic_analyzer import DemographicAnalyzer
-from .person_detector import PersonDetector
-from .person_tracker import PersonTracker
-from .utils import setup_logging
-
+from cctv_analysis.utils.config import Config
+from cctv_analysis.utils.data_types import PersonDetection, DetectionDatabase
+from cctv_analysis.person_tracker import PersonTracker
+from cctv_analysis.utils.logger import setup_logger
 
 class CameraProcessor:
-    """Main class for processing CCTV footage and tracking individuals across cameras."""
-
-    def __init__(self, config: dict):
-        """
-        Initialize the camera processor with configuration.
-
-        Args:
-            config (dict): Configuration dictionary containing processing parameters
-        """
+    """Handles video processing and person detection"""
+    def __init__(self, config: Config):
         self.config = config
-        self.detector = PersonDetector(config["detector"])
-        self.tracker = PersonTracker(config["tracker"])
-        self.demographic_analyzer = DemographicAnalyzer(config["demographics"])
-        self.logger = setup_logging(__name__, config["logging"])
-
-    def process_frame(self, frame: np.ndarray, timestamp: float) -> List[Dict]:
-        """
-        Process a single frame from the video feed.
-
-        Args:
-            frame (np.ndarray): Input frame
-            timestamp (float): Frame timestamp
-
-        Returns:
-            List[Dict]: List of detected persons with their features and demographics
-        """
-        try:
-            # Detect persons in frame
-            detections = self.detector.detect(frame)
-
-            # Track detected persons
-            tracked_persons = self.tracker.update(detections)
-
-            # Analyze demographics for each tracked person
-            results = []
-            for person in tracked_persons:
-                person_roi = self._extract_roi(frame, person["bbox"])
-                if person_roi is None:
-                    continue
-
-                demographics = self.demographic_analyzer.analyze(person_roi)
-
-                results.append(
-                    {
-                        "timestamp": timestamp,
-                        "track_id": person["track_id"],
-                        "bbox": person["bbox"],
-                        "features": person["features"],
-                        **demographics,
-                    }
-                )
-
-            return results
-
-        except Exception as e:
-            self.logger.error(f"Error processing frame: {str(e)}")
-            return []
-
-    def process_video(self, video_path: str, camera_id: int) -> List[Dict]:
-        """
-        Process entire video file.
-
-        Args:
-            video_path (str): Path to video file
-            camera_id (int): Camera identifier
-
-        Returns:
-            List[Dict]: All detections from the video
-        """
+        self.logger = setup_logger("CameraProcessor")
+        self.tracker = PersonTracker(config)
+        self.detection_db = DetectionDatabase()
+        
+        # Ensure output directories exist
+        self.output_dir = Path("output")
+        self.tracks_dir = self.output_dir / "tracks"
+        self.analysis_dir = self.output_dir / "analysis"
+        
+        for dir_path in [self.tracks_dir, self.analysis_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+    
+    def process_video(self, video_path: str, camera_id: int):
+        """Process video with batch processing"""
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+            
         self.logger.info(f"Processing video from camera {camera_id}: {video_path}")
-
-        cap = cv2.VideoCapture(video_path)
+        
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
 
-        detections = []
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        frames_batch = []
+        frame_ids = []
+        
+        try:
+            for frame_idx in tqdm(range(total_frames), 
+                                desc=f"Processing camera {camera_id}"):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Preprocess frame
+                processed_frame = self._preprocess_frame(frame)
+                frames_batch.append(processed_frame)
+                frame_ids.append(frame_idx)
+                
+                # Process batch when ready
+                if (len(frames_batch) == self.config.processing.batch_size or 
+                    frame_idx == total_frames - 1):
+                    batch_detections = self._process_batch(
+                        frames_batch, frame_ids, fps, camera_id
+                    )
+                    for detection in batch_detections:
+                        self.detection_db.add_detection(camera_id, detection)
+                    frames_batch = []
+                    frame_ids = []
+            
+            # Save tracking results
+            self._save_tracking_results(camera_id)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing video: {e}")
+            raise
+        finally:
+            cap.release()
+        
+        return self.detection_db.get_camera_detections(camera_id)
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    def _preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
+        """Preprocess frame for detection"""
+        img = cv2.resize(
+            frame,
+            (self.config.detector.input_size[1],
+             self.config.detector.input_size[0])
+        )
+        img = img.transpose((2, 0, 1))  # HWC to CHW
+        img = torch.from_numpy(img).float()
+        img /= 255.0  # normalize to [0, 1]
+        return img
 
-            timestamp = cap.get(cv2.CAP_PROP_POS_MSEC)
-            frame_detections = self.process_frame(frame, timestamp)
-
-            for detection in frame_detections:
-                detection["camera_id"] = camera_id
-                detections.append(detection)
-
-        cap.release()
+    def _process_batch(self, frames: List[torch.Tensor],
+                      frame_ids: List[int],
+                      fps: float,
+                      camera_id: int) -> List[PersonDetection]:
+        """Process a batch of frames"""
+        device = torch.device(self.config.processing.device)
+        batch = torch.stack(frames).to(device)
+        
+        # Run detection and tracking
+        detections = self.tracker.process_batch(
+            batch, frame_ids, fps
+        )
+        
         return detections
 
-    def analyze_traffic_flow(
-        self, camera1_detections: List[Dict], camera2_detections: List[Dict]
-    ) -> pd.DataFrame:
-        """
-        Analyze traffic flow between two cameras.
-
-        Args:
-            camera1_detections (List[Dict]): Detections from first camera
-            camera2_detections (List[Dict]): Detections from second camera
-
-        Returns:
-            pd.DataFrame: Analysis results
-        """
-        matches = []
-
-        for det1 in camera1_detections:
-            for det2 in camera2_detections:
-                if det2["timestamp"] > det1[
-                    "timestamp"
-                ] and self.tracker.match_features(det1["features"], det2["features"]):
-                    matches.append(
-                        {
-                            "camera1_time": det1["timestamp"],
-                            "camera2_time": det2["timestamp"],
-                            "time_difference": det2["timestamp"] - det1["timestamp"],
-                            "track_id": det1["track_id"],
-                            "age": det1["age"],
-                            "gender": det1["gender"],
-                        }
-                    )
-
-        return pd.DataFrame(matches)
-
-    def _extract_roi(
-        self, frame: np.ndarray, bbox: Tuple[int, int, int, int]
-    ) -> Optional[np.ndarray]:
-        """Extract region of interest from frame using bounding box."""
-        try:
-            x, y, w, h = bbox
-            return frame[y : y + h, x : x + w]
-        except Exception as e:
-            self.logger.error(f"Error extracting ROI: {str(e)}")
-            return None
-
-
-def process_surveillance_footage(
-    camera1_path: str, camera2_path: str, config_path: str = "config/config.yaml"
-) -> pd.DataFrame:
-    """
-    Main function to process surveillance footage from two cameras.
-
-    Args:
-        camera1_path (str): Path to camera 1 footage
-        camera2_path (str): Path to camera 2 footage
-        config_path (str): Path to configuration file
-
-    Returns:
-        pd.DataFrame: Analysis results
-    """
-    # Load configuration
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-
-    # Initialize processor
-    processor = CameraProcessor(config)
-
-    # Process both camera feeds
-    camera1_detections = processor.process_video(camera1_path, camera_id=1)
-    camera2_detections = processor.process_video(camera2_path, camera_id=2)
-
-    # Analyze traffic flow
-    results = processor.analyze_traffic_flow(camera1_detections, camera2_detections)
-
-    return results
+    def _save_tracking_results(self, camera_id: int):
+        """Save tracking results to output directory"""
+        output_file = self.tracks_dir / f"camera_{camera_id}_tracks.npz"
+        
+        # Get all detections for this camera
+        detections = self.detection_db.get_camera_detections(camera_id)
+        
+        # Convert to numpy arrays for efficient storage
+        track_ids = np.array([d.track_id for d in detections])
+        frame_ids = np.array([d.frame_id for d in detections])
+        bboxes = np.array([d.bbox for d in detections])
+        timestamps = np.array([d.timestamp.timestamp() for d in detections])
+        confidences = np.array([d.confidence for d in detections])
+        reid_features = np.array([d.reid_features for d in detections])
+        
+        # Save to compressed numpy format
+        np.savez_compressed(
+            output_file,
+            track_ids=track_ids,
+            frame_ids=frame_ids,
+            bboxes=bboxes,
+            timestamps=timestamps,
+            confidences=confidences,
+            reid_features=reid_features
+        )
+        
+        self.logger.info(f"Saved tracking results to {output_file}")
