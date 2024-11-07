@@ -104,7 +104,8 @@ cctv-analysis/
 
     ```bash
     # Create environment
-    conda env create --file=environment.yml
+    conda env create --file=environment.yml # GPU
+    conda env create --file=environment_cpu.yml # CPU
 
     # Activate environment
     conda activate cctv-analysis
