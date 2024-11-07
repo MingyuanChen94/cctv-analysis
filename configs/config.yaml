@@ -1,0 +1,24 @@
+# configs/models.yaml
+models:
+  detector:
+    name: "yolov8x"
+    weights: "models/detector/yolov8x.pt"
+    confidence: 0.5
+  
+  tracker:
+    name: "bytetrack"
+    track_thresh: 0.5
+    track_buffer: 30
+    match_thresh: 0.8
+    
+  reid:
+    name: "osnet_ain_x1_0"
+    weights: "models/reid/osnet_ain_x1_0.pth"
+    
+  demographics:
+    gender_model:
+      name: "fairface"
+      weights: "models/demographics/fairface_model.pth"
+    age_model:
+      name: "dex"
+      weights: "models/demographics/dex_imdb_wiki.pth"

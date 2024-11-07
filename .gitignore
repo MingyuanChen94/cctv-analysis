@@ -48,3 +48,6 @@ Thumbs.db
 
 # Model Weights
 *.pth
+*.pt
+*.onnx
+*.zip

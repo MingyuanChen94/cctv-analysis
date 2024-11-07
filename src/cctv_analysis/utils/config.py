@@ -1,76 +1,127 @@
-from dataclasses import dataclass
-from typing import Tuple
+"""Configuration handler for CCTV analysis system."""
+
+import os
+import yaml
 from pathlib import Path
+from typing import Any, Dict, Optional, Union
+from dataclasses import dataclass
 
-# Define root project directory
-PROJECT_ROOT = Path(__file__).parents[3]  # Go up 3 levels from utils/config.py
-
-@dataclass
-class DetectorConfig:
-    """YOLOX detector configuration"""
-    exp_file: str = "yolox_l"
-    weights: Path = PROJECT_ROOT / "models" / "detector" / "yolox_l.pth"
-    confidence_threshold: float = 0.5
-    input_size: Tuple[int, int] = (608, 1088)  # (height, width)
-
-@dataclass
-class TrackerConfig:
-    """ByteTracker configuration"""
-    track_buffer: int = 30
-    track_thresh: float = 0.5
-    match_thresh: float = 0.5
-
-@dataclass
-class ReIDConfig:
-    """ReID model configuration"""
-    model: str = 'osnet_x1_0'
-    weights: Path = PROJECT_ROOT / "models" / "reid" / "osnet_x1_0_market.pth"
-    input_size: Tuple[int, int] = (256, 128)  # (height, width)
-
-@dataclass
-class ProcessingConfig:
-    """Video processing configuration"""
-    batch_size: int = 4
-    device: str = 'cuda'
-    data_dir: Path = PROJECT_ROOT / "data" / "videos"
-    output_dir: Path = PROJECT_ROOT / "output"
-    log_dir: Path = PROJECT_ROOT / "logs"
-
-@dataclass
-class MatchingConfig:
-    """Person matching configuration"""
-    max_cosine_distance: float = 0.3
-    max_time_difference: int = 300  # maximum time difference in seconds
+class ConfigError(Exception):
+    """Custom exception for configuration errors."""
+    pass
 
 @dataclass
 class Config:
-    """Main configuration class"""
-    detector: DetectorConfig = DetectorConfig()
-    tracker: TrackerConfig = TrackerConfig()
-    reid: ReIDConfig = ReIDConfig()
-    processing: ProcessingConfig = ProcessingConfig()
-    matching: MatchingConfig = MatchingConfig()
+    """Configuration handler for CCTV analysis system."""
     
-    def __post_init__(self):
-        """Ensure all required directories exist"""
-        # Create required directories
-        for dir_path in [
-            self.processing.data_dir,
-            self.processing.output_dir,
-            self.processing.log_dir,
-            self.detector.weights.parent,
-            self.reid.weights.parent
-        ]:
-            dir_path.mkdir(parents=True, exist_ok=True)
+    def __init__(self, config_path: Optional[Union[str, Path]] = None,
+                 config_dict: Optional[Dict] = None):
+        """
+        Initialize configuration.
+        
+        Args:
+            config_path: Path to YAML configuration file
+            config_dict: Configuration dictionary (alternative to config_path)
+        """
+        if config_dict is not None:
+            self._config = config_dict
+        elif config_path is not None:
+            self._config = self._load_yaml(config_path)
+        else:
+            # Load default config from package directory
+            default_config = Path(__file__).parent.parent.parent.parent / "configs" / "config.yaml"
+            self._config = self._load_yaml(default_config)
             
-    def validate(self):
-        """Validate configuration settings"""
-        # Check if model files exist
-        if not self.detector.weights.exists():
-            raise FileNotFoundError(
-                f"Detector weights not found at: {self.detector.weights}"
-            )
-        if not self.reid.weights.exists():
-            raise FileNotFoundError(
-                f"ReID model weights not found at: {self.reid.weights}"
-            )
+        self._validate_config()
+        self._setup_paths()
+        
+    def _load_yaml(self, config_path: Union[str, Path]) -> Dict:
+        """Load YAML configuration file."""
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise ConfigError(f"Configuration file not found: {config_path}")
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Error parsing configuration file: {e}")
+            
+    def _validate_config(self):
+        """Validate configuration values."""
+        required_sections = [
+            'processing', 'paths', 'detector', 'tracker',
+            'reid', 'matching', 'demographics', 'visualization'
+        ]
+        
+        for section in required_sections:
+            if section not in self._config:
+                raise ConfigError(f"Missing required configuration section: {section}")
+                
+        # Validate processing settings
+        if self.processing.device not in ['cuda', 'cpu']:
+            raise ConfigError("Processing device must be 'cuda' or 'cpu'")
+            
+        # Validate detector settings
+        if self.detector.backend not in ['yolov5', 'ssd', 'hog']:
+            raise ConfigError("Unsupported detector backend")
+            
+        # Validate demographic settings
+        if self.demographics.backend not in ['opencv', 'ssd', 'dlib', 'mtcnn']:
+            raise ConfigError("Unsupported demographics backend")
+            
+    def _setup_paths(self):
+        """Setup and create required directories."""
+        base_dir = Path(__file__).parent.parent.parent.parent
+        
+        # Update relative paths to absolute paths
+        for key, path in self.paths.items():
+            if isinstance(path, str) and not os.path.isabs(path):
+                self.paths[key] = str(base_dir / path)
+                
+        # Create directories if they don't exist
+        for path in self.paths.values():
+            os.makedirs(path, exist_ok=True)
+            
+    def __getattr__(self, name: str) -> Any:
+        """Enable dot notation access to configuration sections."""
+        if name in self._config:
+            return ConfigSection(self._config[name])
+        raise AttributeError(f"Configuration section not found: {name}")
+        
+    def to_dict(self) -> Dict:
+        """Convert configuration to dictionary."""
+        return self._config.copy()
+        
+    def update(self, updates: Dict):
+        """Update configuration with new values."""
+        def update_recursive(original: Dict, updates: Dict):
+            for key, value in updates.items():
+                if (key in original and isinstance(original[key], dict) 
+                    and isinstance(value, dict)):
+                    update_recursive(original[key], value)
+                else:
+                    original[key] = value
+                    
+        update_recursive(self._config, updates)
+        self._validate_config()
+        
+        
+class ConfigSection:
+    """Wrapper for configuration sections enabling dot notation access."""
+    
+    def __init__(self, section: Dict):
+        self._section = section
+        
+    def __getattr__(self, name: str) -> Any:
+        """Enable dot notation access to section items."""
+        if name in self._section:
+            value = self._section[name]
+            if isinstance(value, dict):
+                return ConfigSection(value)
+            return value
+        raise AttributeError(f"Configuration item not found: {name}")
+        
+    def to_dict(self) -> Dict:
+        """Convert section to dictionary."""
+        return self._section.copy()
