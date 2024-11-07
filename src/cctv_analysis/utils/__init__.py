@@ -1,48 +1,54 @@
-#!/usr/bin/env python3
-"""
-Development installation script for CCTV Analysis package.
-This script sets up the package in development mode and verifies the installation.
-"""
+# src/cctv_analysis/utils/init.py
+from ..detector import PersonDetector
+from ..reid import PersonReID
+from ..demographics import DemographicAnalyzer
+from ..matcher import PersonMatcher
+from .config import GPUConfig, ModelPaths
 
-import subprocess
-import sys
-from pathlib import Path
-
-def main():
-    # Get project root directory
-    project_root = Path(__file__).parent.parent.absolute()
-    
-    print("Installing CCTV Analysis package in development mode...")
-    
-    # Install package in development mode
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", str(project_root)],
-            check=True
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing package: {e}")
-        sys.exit(1)
-    
-    # Verify installation
-    print("\nVerifying installation...")
-    try:
-        import cctv_analysis
-        print(f"Successfully installed CCTV Analysis version {cctv_analysis.__version__}")
+class ModelInitializer:
+    def __init__(self, model_paths=None):
+        """
+        Initialize all models with proper GPU configuration
+        Args:
+            model_paths: Optional ModelPaths instance
+        """
+        # Configure device
+        self.device = GPUConfig.get_device()
         
-        # Test imports of main components
-        from cctv_analysis.utils.config import Config
-        from cctv_analysis.analysis import CCTVAnalysis
-        print("All main components successfully imported")
+        # Get model paths
+        if model_paths is None:
+            model_paths = ModelPaths()
+        self.model_paths = model_paths
         
-    except ImportError as e:
-        print(f"Error importing package: {e}")
-        sys.exit(1)
-    
-    print("\nInstallation complete!")
-    print("\nYou can now use the package in Python:")
-    print(">>> from cctv_analysis.utils.config import Config")
-    print(">>> from cctv_analysis.analysis import CCTVAnalysis")
-
-if __name__ == "__main__":
-    main()
+        # Initialize models
+        self.detector = None
+        self.reid_model = None
+        self.demographic_analyzer = None
+        self.matcher = None
+        
+        self._initialize_models()
+        
+    def _initialize_models(self):
+        """Initialize all models with proper error handling"""
+        try:
+            self.detector = PersonDetector(
+                model_path=str(self.model_paths.detector_path),
+                model_size='l',
+                device=self.device
+            )
+            
+            self.reid_model = PersonReID(
+                model_path=str(self.model_paths.reid_path),
+                device=self.device
+            )
+            
+            self.demographic_analyzer = DemographicAnalyzer(
+                device=self.device
+            )
+            
+            self.matcher = PersonMatcher(
+                similarity_threshold=0.75
+            )
+            
+        except Exception as e:
+            raise RuntimeError(f"Error initializing models: {e}")
