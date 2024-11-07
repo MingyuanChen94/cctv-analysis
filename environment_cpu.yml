@@ -1,0 +1,35 @@
+name: cctv-analysis-cpu
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+  - nvidia
+dependencies:
+  - python=3.8
+  - ipykernel
+  - pip
+  - numpy>=1.21.0  
+  - opencv>=4.5.3
+  - pandas>=1.3.0
+  - pytorch>=1.9.0
+  - torchvision==0.19
+  - torchaudio>=0.9.0
+  - matplotlib>=3.4.2
+  - tqdm>=4.61.0
+  - pillow>=8.2.0
+  - scipy>=1.7.0
+  - pyyaml>=5.4.1
+  - ipython>=7.25.0
+  - jupyter>=1.0.0
+  - git>=2.33.0
+  - pip:
+    - git+https://github.com/Megvii-BaseDetection/YOLOX.git
+    - insightface>=0.1.0
+    - torchreid==0.2.5  # Fixed version
+    - wget>=3.2
+    - gdown>=5.2.0
+    - onnxruntime>=1.9.0
+    - seaborn>=0.11.1
+    - ultralytics # YOLO
+    - huggingface_hub>=0.0.12
+    - -e .  # Install the current directory as a package
