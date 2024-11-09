@@ -27,7 +27,7 @@ dependencies:
   - pip:
     - git+https://github.com/Megvii-BaseDetection/YOLOX.git
     - insightface>=0.1.0
-    - torchreid>=0.2.5  # Fixed version
+    - torchreid==0.2.5  # Fixed version
     - wget>=3.2
     - gdown>=5.2.0
     - onnxruntime-gpu>=1.9.0
