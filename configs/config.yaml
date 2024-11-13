@@ -1,24 +1,54 @@
 # configs/models.yaml
+
 models:
-  detector:
-    name: "yolov8x"
-    weights: "models/detector/yolov8x.pt"
-    confidence: 0.5
-  
-  tracker:
-    name: "bytetrack"
-    track_thresh: 0.5
-    track_buffer: 30
-    match_thresh: 0.8
-    
-  reid:
-    name: "osnet_ain_x1_0"
-    weights: "models/reid/osnet_ain_x1_0.pth"
-    
+  person_detection:
+    name: "YOLOv8x6"
+    url: "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8x6.pt"
+    checksum: "your_checksum_here"
+    config:
+      conf_thresh: 0.3
+      input_size: [1280, 1280]  # YOLOv8x6 optimal input size
+      device: "cuda"
+      track: false  # Enable if tracking is needed
+
+  person_reid:
+    name: "inception_v3_reid"
+    url: "path_to_your_pretrained_reid_model"
+    checksum: "your_checksum_here"
+    architecture: "inception_v3"
+    config:
+      feature_dim: 2048
+      input_size: [299, 299]
+      num_classes: 751  # Market-1501 dataset
+      pretrained: true
+
   demographics:
-    gender_model:
-      name: "fairface"
-      weights: "models/demographics/fairface_model.pth"
-    age_model:
-      name: "dex"
-      weights: "models/demographics/dex_imdb_wiki.pth"
+    name: "insight_face"
+    url: "path_to_insightface_model"
+    checksum: "your_checksum_here"
+    allowed_modules: ["detection", "genderage"]
+    providers: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 100
+  optimizer: "Adam"
+  scheduler:
+    type: "StepLR"
+    step_size: 30
+    gamma: 0.1
+
+inference:
+  reid:
+    similarity_threshold: 0.5
+    max_time_diff: 3600  # Maximum time difference in seconds
+    min_detection_confidence: 0.3
+
+  demographics:
+    min_face_confidence: 0.9
+    age_groups:
+      - [0, 18, "under_18"]
+      - [18, 30, "18-29"]
+      - [30, 50, "30-49"]
+      - [50, 999, "50+"]
