@@ -7,47 +7,61 @@ import os
 import sys
 
 def init_pretrained_weights(model, model_path):
-    """Initializes model with pretrained weights.
-    Layers that don't match with pretrained layers in name or size are kept unchanged.
-    """
+    """Initializes model with pretrained weights."""
     try:
         checkpoint = torch.load(model_path, map_location="cpu")
-    except Exception as e:
-        print(f"Error loading weights from {model_path}: {e}")
-        return
-
-    try:
-        state_dict = checkpoint
-        if 'state_dict' in checkpoint:
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
-        model.load_state_dict(state_dict, strict=False)
+        else:
+            state_dict = checkpoint
+            
+        # Remove 'module.' prefix if present
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.'):
+                k = k[7:]
+            new_state_dict[k] = v
+            
+        model.load_state_dict(new_state_dict, strict=False)
         print(f"Successfully loaded pretrained weights from {model_path}")
     except Exception as e:
-        print(f"Error loading state dict: {e}")
+        print(f"Error loading weights: {e}")
+
+class ConvLayer(torch.nn.Module):
+    """Basic convolutional layer."""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super(ConvLayer, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, 
+                                  padding=padding, bias=False)
+        self.bn = torch.nn.BatchNorm2d(out_channels)
+        self.relu = torch.nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
 
 class OSBlock(torch.nn.Module):
+    """Omni-scale block"""
     def __init__(self, in_channels, out_channels, reduction=4, T=4):
         super(OSBlock, self).__init__()
         assert T >= 1
         assert out_channels >= reduction and out_channels % reduction == 0
-
+        
         mid_channels = out_channels // reduction
 
-        self.conv1 = torch.nn.Conv2d(in_channels, mid_channels, 1, bias=False)
-        self.bn1 = torch.nn.BatchNorm2d(mid_channels)
+        self.conv1 = ConvLayer(in_channels, mid_channels, 1)
         self.conv2 = torch.nn.ModuleList()
         for t in range(T):
             self.conv2.append(
                 torch.nn.Sequential(
-                    torch.nn.Conv2d(mid_channels, mid_channels, 3, stride=1, padding=1, bias=False),
-                    torch.nn.BatchNorm2d(mid_channels),
-                    torch.nn.ReLU(inplace=True)
+                    ConvLayer(mid_channels, mid_channels, 3, stride=1, padding=1)
                 )
             )
         self.conv3 = torch.nn.Conv2d(mid_channels, out_channels, 1, bias=False)
         self.bn3 = torch.nn.BatchNorm2d(out_channels)
-        self.relu = torch.nn.ReLU(inplace=True)
-
+        
         if in_channels != out_channels:
             self.downsample = torch.nn.Sequential(
                 torch.nn.Conv2d(in_channels, out_channels, 1, bias=False),
@@ -56,75 +70,73 @@ class OSBlock(torch.nn.Module):
         else:
             self.downsample = None
 
+        self.relu = torch.nn.ReLU(inplace=True)
+
     def forward(self, x):
         identity = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
+        
+        x1 = self.conv1(x)
+        x2 = 0
         for conv2_t in self.conv2:
-            out = conv2_t(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
+            x2_t = conv2_t(x1)
+            x2 = x2 + x2_t
+        x2_norm = x2 / len(self.conv2)
+        
+        x3 = self.conv3(x2_norm)
+        x3 = self.bn3(x3)
 
         if self.downsample is not None:
-            identity = self.downsample(x)
+            identity = self.downsample(identity)
 
-        out += identity
+        out = x3 + identity
         out = self.relu(out)
+
         return out
 
 class OSNet(torch.nn.Module):
+    """OSNet architecture"""
     def __init__(self, num_classes, blocks=[2, 2, 2], channels=[64, 256, 384, 512], feature_dim=512):
         super(OSNet, self).__init__()
         self.feature_dim = feature_dim
 
         # Conv Layer 1
-        self.conv1 = torch.nn.Conv2d(3, channels[0], 7, stride=2, padding=3, bias=False)
-        self.bn1 = torch.nn.BatchNorm2d(channels[0])
-        self.relu = torch.nn.ReLU(inplace=True)
-        self.maxpool = torch.nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv1 = torch.nn.Sequential(
+            ConvLayer(3, channels[0], 7, stride=2, padding=3),
+            torch.nn.MaxPool2d(3, stride=2, padding=1)
+        )
 
-        # OSNet Blocks
-        self.layers = torch.nn.ModuleList([])
-        
-        # Conv Layer 2
-        layer2 = []
-        in_channels = channels[0]
-        for i in range(blocks[0]):
-            layer2.append(OSBlock(in_channels, channels[1]))
-            in_channels = channels[1]
-        self.layers.append(torch.nn.Sequential(*layer2))
-        
-        # Conv Layer 3
-        layer3 = []
-        for i in range(blocks[1]):
-            layer3.append(OSBlock(channels[1], channels[2]))
-        self.layers.append(torch.nn.Sequential(*layer3))
-        
-        # Conv Layer 4
-        layer4 = []
-        for i in range(blocks[2]):
-            layer4.append(OSBlock(channels[2], channels[3]))
-        self.layers.append(torch.nn.Sequential(*layer4))
+        # Conv Layer 2-4
+        self.conv2 = self._make_layer(channels[0], channels[1], blocks[0])
+        self.conv3 = self._make_layer(channels[1], channels[2], blocks[1])
+        self.conv4 = self._make_layer(channels[2], channels[3], blocks[2])
 
         # Global Average Pooling
         self.global_avgpool = torch.nn.AdaptiveAvgPool2d(1)
 
         # Fully Connected Layers
-        self.fc = torch.nn.Linear(channels[3], feature_dim)
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(channels[3], feature_dim),
+            torch.nn.BatchNorm1d(feature_dim),
+            torch.nn.ReLU(inplace=True)
+        )
         self.classifier = torch.nn.Linear(feature_dim, num_classes)
 
-    def forward(self, x, return_feats=False):
+    def _make_layer(self, in_channels, out_channels, blocks):
+        layers = []
+        layers.append(OSBlock(in_channels, out_channels))
+        for i in range(1, blocks):
+            layers.append(OSBlock(out_channels, out_channels))
+        return torch.nn.Sequential(*layers)
+
+    def featuremaps(self, x):
         x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        return x
 
-        for layer in self.layers:
-            x = layer(x)
-
+    def forward(self, x, return_feats=False):
+        x = self.featuremaps(x)
         x = self.global_avgpool(x)
         x = x.view(x.size(0), -1)
         
@@ -138,28 +150,20 @@ class OSNet(torch.nn.Module):
 
 class PersonReID:
     def __init__(self, model_path=None, device="cuda"):
-        """
-        Initialize PersonReID model
-        Args:
-            model_path: Path to pretrained weights
-            device: Device to run inference on ('cuda' or 'cpu')
-        """
+        """Initialize PersonReID model"""
         if device == "cuda" and torch.cuda.is_available():
             self.device = "cuda"
-            # Enable TF32 on Ampere GPUs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Set cudnn to benchmark mode for faster convolutions
             torch.backends.cudnn.benchmark = True
             print(f"Using GPU: {torch.cuda.get_device_name()}")
-            print(f"GPU Memory Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         else:
             self.device = "cpu"
-            print("GPU not available, using CPU")
+            print("Using CPU")
         
-        # Initialize model for Market-1501 dataset (751 identities)
+        # Initialize OSNet model
         self.model = OSNet(
-            num_classes=751,
+            num_classes=751,  # Market-1501 dataset
             blocks=[2, 2, 2],
             channels=[64, 256, 384, 512],
             feature_dim=512
@@ -178,40 +182,35 @@ class PersonReID:
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
     
-    def preprocess_image(self, img_array):
-        """
-        Preprocess image from OpenCV format to model input
-        Args:
-            img_array: numpy array in BGR format (OpenCV default)
-        Returns:
-            torch tensor
-        """
-        if img_array is None or img_array.size == 0:
+    def preprocess_image(self, img):
+        """Preprocess image from OpenCV format to model input"""
+        if img is None or img.size == 0:
             return None
             
-        # Convert BGR to RGB
-        img_rgb = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
-        # Convert to PIL Image
-        img_pil = Image.fromarray(img_rgb)
-        # Apply transformations
-        img_tensor = self.transform(img_pil)
-        return img_tensor
+        try:
+            # Convert BGR to RGB
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Handle small images
+            if img_rgb.shape[0] < 10 or img_rgb.shape[1] < 10:
+                return None
+                
+            # Convert to PIL Image
+            img_pil = Image.fromarray(img_rgb)
+            
+            # Apply transformations
+            img_tensor = self.transform(img_pil)
+            return img_tensor
+            
+        except Exception as e:
+            print(f"Error in image preprocessing: {e}")
+            return None
         
     @torch.no_grad()
     def extract_features(self, img_crop):
-        """
-        Extract ReID features from a cropped person image
-        Args:
-            img_crop: numpy array of cropped person image (BGR format)
-        Returns:
-            feature vector (numpy array)
-        """
+        """Extract ReID features from a cropped person image"""
         try:
             if img_crop is None or img_crop.size == 0:
-                return None
-                
-            # Ensure minimum size
-            if img_crop.shape[0] < 10 or img_crop.shape[1] < 10:
                 return None
                 
             # Preprocess image
@@ -219,6 +218,7 @@ class PersonReID:
             if img_tensor is None:
                 return None
                 
+            # Add batch dimension
             img_tensor = img_tensor.unsqueeze(0).to(self.device)
             
             # Extract features
@@ -234,17 +234,10 @@ class PersonReID:
             return None
         
     def compute_similarity(self, feat1, feat2):
-        """
-        Compute cosine similarity between two feature vectors
-        Args:
-            feat1, feat2: numpy arrays of same dimension
-        Returns:
-            float: similarity score between 0 and 1
-        """
+        """Compute cosine similarity between two feature vectors"""
         if feat1 is None or feat2 is None:
             return 0.0
             
-        # Ensure features are normalized
         feat1_norm = feat1 / (np.linalg.norm(feat1) + 1e-8)
         feat2_norm = feat2 / (np.linalg.norm(feat2) + 1e-8)
         
