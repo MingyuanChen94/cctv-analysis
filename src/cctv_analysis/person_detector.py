@@ -1,191 +1,125 @@
-import logging
-from pathlib import Path
-from typing import Dict, List, Tuple
+# src/cctv_analysis/detector.py
 
+import torch
+from ultralytics import YOLO
 import cv2
 import numpy as np
-import torch
-
 
 class PersonDetector:
-    """
-    Person detection class using YOLOv5 model.
-    Supports multiple detection backends with easy switching between them.
-    """
-
-    SUPPORTED_BACKENDS = ["yolov5", "ssd", "hog"]
-
-    def __init__(self, config: dict):
+    def __init__(self, model_path=None, device="cuda"):
         """
-        Initialize the person detector.
-
+        Initialize YOLOv8x6 detector
         Args:
-            config (dict): Configuration dictionary containing:
-                - backend: Detection backend ('yolov5', 'ssd', 'hog')
-                - model_path: Path to model weights (for deep learning backends)
-                - confidence_threshold: Detection confidence threshold
-                - device: Device to run inference on ('cpu' or 'cuda')
+            model_path: Path to model weights (if None, downloads from ultralytics)
+            device: Device to run inference on ('cuda' or 'cpu')
         """
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+        if device == "cuda" and torch.cuda.is_available():
+            self.device = "cuda"
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            print(f"Using GPU: {torch.cuda.get_device_name()}")
+            print(f"GPU Memory Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        else:
+            self.device = "cpu"
+            print("GPU not available, using CPU")
 
-        self.backend = config.get("backend", "yolov5")
-        if self.backend not in self.SUPPORTED_BACKENDS:
-            raise ValueError(f"Unsupported backend: {self.backend}")
-
-        self.confidence_threshold = config.get("confidence_threshold", 0.5)
-        self.device = config.get(
-            "device", "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
-        self._initialize_detector()
-
-    def _initialize_detector(self):
-        """Initialize the detection backend."""
         try:
-            if self.backend == "yolov5":
-                self.model = torch.hub.load(
-                    "ultralytics/yolov5", "yolov5s", pretrained=True
-                )
-                self.model.to(self.device)
-                self.model.eval()
+            # Initialize YOLOv8x6 model
+            if model_path:
+                self.model = YOLO(model_path)
+            else:
+                self.model = YOLO('yolov8x6.pt')
+            
+            # Move model to specified device
+            self.model.to(self.device)
+            
+            print("Successfully loaded YOLOv8x6 model")
+            
+        except Exception as e:
+            raise RuntimeError(f"Error initializing YOLOv8x6 model: {e}")
 
-            elif self.backend == "ssd":
-                self.model = cv2.dnn.readNet(
-                    str(Path(self.config["model_path"]) / "ssd_weights.pb"),
-                    str(Path(self.config["model_path"]) / "ssd_config.pbtxt"),
-                )
-                if self.device == "cuda":
-                    self.model.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                    self.model.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+    def detect(self, img, conf_thresh=0.3):
+        """
+        Detect persons in image
+        Args:
+            img: OpenCV image in BGR format
+            conf_thresh: Confidence threshold
+        Returns:
+            List of detections, each in (x1, y1, x2, y2, confidence) format
+        """
+        try:
+            # Check for valid image
+            if img is None or img.size == 0:
+                print("Invalid image input")
+                return []
 
-            elif self.backend == "hog":
-                self.model = cv2.HOGDescriptor()
-                self.model.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            # Run inference
+            results = self.model(img, conf=conf_thresh, classes=0)  # class 0 is person
+            
+            # Extract person detections
+            detections = []
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    if box.conf.item() >= conf_thresh:
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        conf = box.conf.item()
+                        
+                        # Filter out unrealistic detections
+                        w = x2 - x1
+                        h = y2 - y1
+                        if w < 20 or h < 40 or w/h > 2 or h/w > 4:
+                            continue
+                            
+                        detections.append([x1, y1, x2, y2, conf])
+
+            return np.array(detections)
 
         except Exception as e:
-            self.logger.error(f"Error initializing {self.backend} detector: {str(e)}")
-            raise
-
-    def detect(self, frame: np.ndarray) -> List[Dict[str, any]]:
-        """
-        Detect persons in the given frame.
-
-        Args:
-            frame (np.ndarray): Input frame
-
-        Returns:
-            List[Dict]: List of detections, each containing:
-                - bbox: Tuple[int, int, int, int] (x, y, width, height)
-                - confidence: float
-                - features: np.ndarray (extracted features for re-identification)
-        """
-        if frame is None:
+            print(f"Error in detection: {e}")
             return []
 
-        try:
-            if self.backend == "yolov5":
-                return self._detect_yolov5(frame)
-            elif self.backend == "ssd":
-                return self._detect_ssd(frame)
-            elif self.backend == "hog":
-                return self._detect_hog(frame)
-
-        except Exception as e:
-            self.logger.error(f"Error during detection: {str(e)}")
-            return []
-
-    def _detect_yolov5(self, frame: np.ndarray) -> List[Dict[str, any]]:
-        """YOLOv5 detection implementation."""
-        results = self.model(frame)
-        detections = []
-
-        # Process YOLOv5 results
-        for *xyxy, conf, cls in results.xyxy[0]:
-            if int(cls) == 0 and conf >= self.confidence_threshold:  # class 0 is person
-                x1, y1, x2, y2 = map(int, xyxy)
-                w, h = x2 - x1, y2 - y1
-
-                detection = {
-                    "bbox": (x1, y1, w, h),
-                    "confidence": float(conf),
-                    "features": self._extract_features(frame[y1:y2, x1:x2]),
-                }
-                detections.append(detection)
-
-        return detections
-
-    def _detect_ssd(self, frame: np.ndarray) -> List[Dict[str, any]]:
-        """SSD detection implementation."""
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [127.5, 127.5, 127.5])
-        self.model.setInput(blob)
-        detections = self.model.forward()
-
-        results = []
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence >= self.confidence_threshold:
-                class_id = int(detections[0, 0, i, 1])
-                if class_id == 15:  # SSD person class
-                    box = detections[0, 0, i, 3:7] * np.array(
-                        [frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]]
-                    )
-                    x1, y1, x2, y2 = map(int, box)
-                    w, h = x2 - x1, y2 - y1
-
-                    detection = {
-                        "bbox": (x1, y1, w, h),
-                        "confidence": float(confidence),
-                        "features": self._extract_features(frame[y1:y2, x1:x2]),
-                    }
-                    results.append(detection)
-
-        return results
-
-    def _detect_hog(self, frame: np.ndarray) -> List[Dict[str, any]]:
-        """HOG detection implementation."""
-        boxes, weights = self.model.detectMultiScale(
-            frame, winStride=(8, 8), padding=(4, 4), scale=1.05
-        )
-
-        results = []
-        for (x, y, w, h), confidence in zip(boxes, weights):
-            if confidence >= self.confidence_threshold:
-                detection = {
-                    "bbox": (int(x), int(y), int(w), int(h)),
-                    "confidence": float(confidence),
-                    "features": self._extract_features(frame[y : y + h, x : x + w]),
-                }
-                results.append(detection)
-
-        return results
-
-    def _extract_features(self, person_img: np.ndarray) -> np.ndarray:
+    def draw_detections(self, img, detections, show_conf=True, color=(0, 255, 0)):
         """
-        Extract features from detected person image for re-identification.
-
+        Draw detection boxes on image
         Args:
-            person_img (np.ndarray): Cropped person image
-
+            img: OpenCV image
+            detections: List of detections from detect()
+            show_conf: Whether to show confidence scores
+            color: BGR color tuple for boxes
         Returns:
-            np.ndarray: Extracted features
+            Image with drawn detections
         """
-        try:
-            # Resize to standard size
-            resized = cv2.resize(person_img, (128, 256))
-
-            # Convert to float and normalize
-            normalized = resized.astype(np.float32) / 255.0
-
-            # Simple feature extraction (can be replaced with more sophisticated methods)
-            features = cv2.calcHist(
-                [normalized], [0, 1, 2], None, [8, 8, 8], [0, 1, 0, 1, 0, 1]
-            )
-            features = features.flatten()
-            features = features / features.sum()  # L1 normalization
-
-            return features
-
-        except Exception as e:
-            self.logger.error(f"Error extracting features: {str(e)}")
-            return np.array([])
+        img_draw = img.copy()
+        for det in detections:
+            x1, y1, x2, y2, conf = map(float, det)
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            
+            # Draw box
+            cv2.rectangle(img_draw, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw confidence score
+            if show_conf:
+                label = f"person {conf:.2f}"
+                (label_w, label_h), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+                )
+                cv2.rectangle(
+                    img_draw,
+                    (x1, y1 - label_h - baseline),
+                    (x1 + label_w, y1),
+                    color,
+                    -1
+                )
+                cv2.putText(
+                    img_draw,
+                    label,
+                    (x1, y1 - baseline),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    2
+                )
+        
+        return img_draw
