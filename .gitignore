@@ -53,3 +53,4 @@ Thumbs.db
 *.zip
 /models/.temp
 *.tar
+*.png
