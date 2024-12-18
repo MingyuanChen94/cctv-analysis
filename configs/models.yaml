@@ -1,39 +1,45 @@
-# Model configurations for CCTV Analysis
+# configs/models.yaml
 
 models:
   detector:
     name: "YOLOX-L"
-    version: "0.1.1rc0"
+    file: "yolox_l.pth"
     url: "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.pth"
-    output_path: "detector/yolox_l.pth"  # Relative to models directory
-    md5: "87592389624fa3963c929a3fd01cbf8f"
-    size_mb: 155.4
-    source_type: "direct"
-    required: true
-    description: "YOLOX large model for person detection"
-    paper_url: "https://arxiv.org/abs/2107.08430"
+    checksum: "md5:87df82e84b1c42b46a1ccaa43149a38c"
 
   reid:
     name: "OSNet"
-    version: "1.0.0"
-    url: "https://drive.google.com/uc?id=1vduhq5DpN2q1g4fYEZfPI17MJeh9qyrA"
-    output_path: "reid/osnet_x1_0.pth"  # Relative to models directory
-    source_type: "gdrive"
-    size_mb: 73.2
-    required: true
-    description: "OSNet model for person re-identification"
-    paper_url: "https://arxiv.org/abs/1905.00953"
+    file: "osnet_x1_0.pth"
+    url: "https://github.com/KaiyangZhou/deep-person-reid/releases/download/v1.0.0/osnet_x1_0_market_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth"
+    checksum: "md5:fa6f05c8f76932559b3aa7683d3b5e46"
 
-download_settings:
-  chunk_size: 8192
-  retry_count: 3
-  timeout: 30
-  verify_ssl: true
-  progress_bar: true
-  gdrive:
-    cookies_file: ".gdrive_cookies"  # Temporary file for Google Drive cookies
+  demographics:
+    name: "GenderAge"
+    file: "genderage.onnx"
+    url: "https://github.com/deepinsight/insightface/releases/download/v0.7/genderage.onnx"
+    checksum: "md5:917f1f6124dde647086aafd83aa04852"
 
 paths:
-  base_dir: "./models"  # Base models directory
-  temp_dir: ".temp"     # Relative to base_dir
-  backup_dir: ".backup" # Relative to base_dir
+  base_dir: "."
+  models_dir: "models"
+  detector_dir: "models/detector"
+  reid_dir: "models/reid"
+  demographics_dir: "models/demographics"
+
+settings:
+  detector:
+    model_size: "l"  # Options: "s", "m", "l", "x"
+    confidence_threshold: 0.5
+    nms_threshold: 0.45
+    
+  reid:
+    feature_dim: 512
+    input_size: [256, 128]  # [height, width]
+    
+  demographics:
+    confidence_threshold: 0.6
+    age_groups:
+      - [0, 18, "under_18"]
+      - [18, 30, "18-29"]
+      - [30, 50, "30-49"]
+      - [50, 999, "50+"]
