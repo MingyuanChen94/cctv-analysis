@@ -19,6 +19,7 @@ dependencies:
   - ipython>=7.25.0
   - jupyter>=1.0.0
   - git>=2.33.0
+  - GPUtil
   - pip:
     # Install PyTorch with CUDA 12.1 support
     - torch==2.1.2+cu121
