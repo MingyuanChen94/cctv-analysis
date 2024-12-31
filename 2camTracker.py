@@ -53,7 +53,7 @@ class PersonTracker:
         self.min_tracking_frames = 10  # Minimum frames before counting
         self.confidence_threshold = 5   # Required confidence before counting
 
-         # Add new tracking sets
+        # Add new tracking sets
         self.camera1_entries = set()  # Track unique entries in Camera 1
         self.camera1_to_camera2 = set()  # Track people moving between cameras
 
@@ -152,62 +152,62 @@ class PersonTracker:
         except Exception as e:
             self.logger.error(f"Error extracting ReID features: {e}")
             return None
-        
+
     def match_person(self, features, current_time, camera_id):
         """Enhanced matching with multiple feature comparisons"""
         best_match_id = None
         best_match_score = 0.5  # Lower threshold for initial matching
-        
+
         current_features = np.array(features).flatten()
         current_features = current_features / np.linalg.norm(current_features)
-        
+
         candidates = []
-        
+
         # First pass: collect all potential matches
         for person_id, person_info in self.tracked_individuals.items():
             # Skip completed tracks
             if person_id in self.completed_tracks:
                 continue
-                
+
             # Skip if track is too old (increased time gap)
-            if (person_info.last_seen is not None and 
-                current_time - person_info.last_seen > self.max_track_gap):
+            if (person_info.last_seen is not None and
+                    current_time - person_info.last_seen > self.max_track_gap):
                 continue
-                
+
             # Compare with all stored features
             match_scores = []
             for stored_feat in person_info.features:
                 score = self.compute_similarity(current_features, stored_feat)
                 match_scores.append(score)
-                
+
             if match_scores:
                 # Use both max and average scores for better matching
                 max_score = max(match_scores)
                 avg_score = sum(match_scores) / len(match_scores)
                 combined_score = 0.7 * max_score + 0.3 * avg_score
-                
+
                 if combined_score > best_match_score:
                     candidates.append((person_id, combined_score))
-        
+
         # Sort candidates by score
         candidates.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Second pass: validate top matches
         for candidate_id, score in candidates[:3]:  # Check top 3 matches
             person_info = self.tracked_individuals[candidate_id]
-            
+
             # Additional validation for camera transitions
             if camera_id == 'camera2' and person_info.has_exited_camera1:
                 transit_time = current_time - person_info.camera1_exit_time
                 if 30 <= transit_time <= 240:  # Allow 30s to 4min transit time
                     return candidate_id
-                    
+
             # For same camera matching
             elif camera_id == person_info.last_camera:
                 time_gap = current_time - person_info.last_seen
                 if time_gap < self.max_track_gap:
                     return candidate_id
-        
+
         return None
 
     def compute_similarity(self, features1, features2):
@@ -215,13 +215,13 @@ class PersonTracker:
         # Convert features to numpy arrays if they aren't already
         feat1 = np.array(features1).flatten()
         feat2 = np.array(features2).flatten()
-        
+
         # Normalize features
         feat1 = feat1 / np.linalg.norm(feat1)
         feat2 = feat2 / np.linalg.norm(feat2)
-        
+
         return np.dot(feat1, feat2)
-    
+
     def validate_detection(self, bbox, camera_id):
         """Comprehensive validation of initial detection"""
         x_center = (bbox[0] + bbox[2]) / 2
@@ -263,22 +263,22 @@ class PersonTracker:
         """Validate consistency of movement pattern"""
         if len(person_info.prev_positions) < 3:
             return True
-            
-        current_center = ((current_bbox[0] + current_bbox[2]) / 2, 
-                        (current_bbox[1] + current_bbox[3]) / 2)
-                        
+
+        current_center = ((current_bbox[0] + current_bbox[2]) / 2,
+                          (current_bbox[1] + current_bbox[3]) / 2)
+
         # Get last known position
         last_center = person_info.prev_positions[-1][0]
-        
+
         # Calculate displacement
         dx = current_center[0] - last_center[0]
         dy = current_center[1] - last_center[1]
-        
+
         # Check for unrealistic movements
         max_movement = 100  # Maximum allowed movement between frames
         if abs(dx) > max_movement or abs(dy) > max_movement:
             return False
-            
+
         return True
 
     def validate_movement_sequence(self, positions, min_sequence=7):
@@ -328,15 +328,15 @@ class PersonTracker:
                 return False
 
         return True
-    
+
     def analyze_movement_pattern(self, positions, min_positions=3):
         """Analyze movement pattern from position history"""
         if len(positions) < min_positions:
             return None
-            
+
         # Analyze the last several positions to determine movement direction
         recent_positions = positions[-min_positions:]
-        
+
         # Calculate vertical and horizontal movements
         movements = []
         for i in range(1, len(recent_positions)):
@@ -345,18 +345,19 @@ class PersonTracker:
             dy = curr_pos[1] - prev_pos[1]
             dx = curr_pos[0] - prev_pos[0]
             movements.append((dx, dy))
-        
+
         # Check if movement is consistently downward
         downward_count = sum(1 for _, dy in movements if dy > 0)
-        if downward_count >= len(movements) * 0.8:  # 80% of movements must be downward
+        # 80% of movements must be downward
+        if downward_count >= len(movements) * 0.8:
             # Calculate average vertical and horizontal movement
             avg_dy = sum(dy for _, dy in movements) / len(movements)
             avg_dx = sum(dx for dx, _ in movements) / len(movements)
-            
+
             # Ensure vertical movement is significant compared to horizontal
             if avg_dy > abs(avg_dx) * 1.5:  # Vertical movement should be clearly dominant
                 return 'entering'
-                
+
         return 'other'
 
     def validate_track_continuity(self, person_info, current_time):
@@ -403,18 +404,20 @@ class PersonTracker:
         """Enhanced analysis of person trajectories to detect entry and exit patterns"""
         if len(person_info.prev_positions) < 5:
             return None
-            
+
         door_coords = self.doors[camera_id]
         door_top = door_coords[0][1]
         door_bottom = door_coords[1][1]
         door_height = door_bottom - door_top
-        
+
         # Current position
         current_y = (bbox[1] + bbox[3]) / 2
-        
+
         # Get movement history
-        positions = [(pos[0][1], pos[1]) for pos in person_info.prev_positions[-5:]]  # (y-coord, timestamp)
-        
+        # (y-coord, timestamp)
+        positions = [(pos[0][1], pos[1])
+                     for pos in person_info.prev_positions[-5:]]
+
         # Calculate vertical movement
         y_movements = []
         for i in range(1, len(positions)):
@@ -423,7 +426,7 @@ class PersonTracker:
             if dt > 0:  # Avoid division by zero
                 velocity = dy/dt
                 y_movements.append(velocity)
-        
+
         if not y_movements:
             return None
 
@@ -431,22 +434,22 @@ class PersonTracker:
         """Update person information with improved feature storage"""
         if person_id not in self.tracked_individuals:
             self.tracked_individuals[person_id] = PersonInfo(person_id)
-            
+
         person_info = self.tracked_individuals[person_id]
-        
+
         # Update basic tracking data
         person_info.update_features(features.squeeze())
         person_info.update_appearance(frame[bbox[1]:bbox[3], bbox[0]:bbox[2]])
         if not person_info.update_position(bbox, timestamp):
             return
-            
+
         # Update camera-specific information
         person_info.last_camera = camera_id
         person_info.last_seen = timestamp
-        
+
         # Track entries and exits
         movement = self.analyze_trajectories(person_info, bbox, camera_id)
-        
+
         if movement == 'entering':
             if not person_info.entry_recorded:
                 if camera_id == 'camera1':
@@ -457,19 +460,20 @@ class PersonTracker:
                     self.camera1_to_camera2.add(person_id)
                 person_info.entry_recorded = True
                 self.entry_count += 1
-                
+
         elif movement == 'exiting' and camera_id == 'camera1':
             if not person_info.exit_recorded:
                 person_info.exit_recorded = True
                 person_info.has_exited_camera1 = True
                 person_info.camera1_exit_time = timestamp
-        
+
         # Update camera times
         if camera_id not in person_info.camera_times:
-            person_info.camera_times[camera_id] = {'first': timestamp, 'last': timestamp}
+            person_info.camera_times[camera_id] = {
+                'first': timestamp, 'last': timestamp}
         else:
             person_info.camera_times[camera_id]['last'] = timestamp
-    
+
     def get_tracking_stats(self):
         """Get statistics about tracked individuals"""
         stats = {
@@ -478,13 +482,13 @@ class PersonTracker:
             'camera1_to_camera2': len(self.camera1_to_camera2),
             'camera1_exits': len([p for p in self.tracked_individuals.values() if p.has_exited_camera1])
         }
-        
+
         # Analyze timing for camera transitions
         transitions = []
         for person_id in self.camera1_to_camera2:
             person_info = self.tracked_individuals[person_id]
-            if ('camera1' in person_info.camera_times and 
-                'camera2' in person_info.camera_times):
+            if ('camera1' in person_info.camera_times and
+                    'camera2' in person_info.camera_times):
                 camera1_exit = person_info.camera_times['camera1']['last']
                 camera2_entry = person_info.camera_times['camera2']['first']
                 if camera2_entry > camera1_exit:
@@ -495,189 +499,215 @@ class PersonTracker:
                         'camera2_entry': camera2_entry,
                         'transit_time': transit_time
                     })
-        
+
         stats['transitions'] = transitions
         if transitions:
-            stats['avg_transit_time'] = sum(t['transit_time'] for t in transitions) / len(transitions)
-        
+            stats['avg_transit_time'] = sum(
+                t['transit_time'] for t in transitions) / len(transitions)
+
         return stats
-    
+
     def process_frame(self, frame, camera_id, timestamp):
         """Process a single frame"""
         # Run YOLO detection
         results = self.yolo_model(frame)
-        
+
         # Clear current frame detections
         self.current_frame_detections = {}
-        
+
         for detection in results[0].boxes.data:
             # Convert bbox tensor to integer coordinates
             bbox = [int(coord.item()) for coord in detection[:4]]
             confidence = float(detection[4].item())
             class_id = int(detection[5].item())
-            
+
             # Only process person detections with high confidence
             if class_id == 0 and confidence > 0.5:  # 0 is person class
                 if self.is_in_door_area(bbox, camera_id):
                     # First check initial direction
                     if not self.validate_detection(bbox, camera_id):
                         continue
-                        
+
                     features = self.extract_reid_features(frame, bbox)
                     if features is not None:
-                        person_id = self.match_person(features, timestamp, camera_id)
-                        
+                        person_id = self.match_person(
+                            features, timestamp, camera_id)
+
                         if person_id is None:
                             # Create new track for potential new person
                             person_id = len(self.tracked_individuals)
-                            self.tracked_individuals[person_id] = PersonInfo(person_id)
-                            
+                            self.tracked_individuals[person_id] = PersonInfo(
+                                person_id)
+
                         # Check for duplicate detections in current frame
                         if person_id not in self.current_frame_detections:
-                            person_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-                            self.update_person_info(person_id, person_img, bbox, camera_id, timestamp, features)
-                            
+                            person_img = frame[bbox[1]                                               :bbox[3], bbox[0]:bbox[2]]
+                            self.update_person_info(
+                                person_id, person_img, bbox, camera_id, timestamp, features)
+
                             # Verify movement pattern after updating position
                             person_info = self.tracked_individuals[person_id]
                             if len(person_info.prev_positions) >= 3:
-                                movement = self.analyze_movement_pattern(person_info.prev_positions)
+                                movement = self.analyze_movement_pattern(
+                                    person_info.prev_positions)
                                 if movement != 'entering':
                                     self.completed_tracks.add(person_id)
                                     continue
-                                    
+
                             self.current_frame_detections[person_id] = bbox
-                            
+
                             # Only draw boxes for valid tracks
                             if person_id not in self.completed_tracks:
-                                cv2.rectangle(frame, (bbox[0], bbox[1]), 
-                                            (bbox[2], bbox[3]), (0, 255, 0), 2)
-                                cv2.putText(frame, f"ID: {person_id}", 
-                                        (bbox[0], bbox[1]-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
+                                cv2.rectangle(frame, (bbox[0], bbox[1]),
+                                              (bbox[2], bbox[3]), (0, 255, 0), 2)
+                                cv2.putText(frame, f"ID: {person_id}",
+                                            (bbox[0], bbox[1]-10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
         # Draw entry count and door area
         cv2.putText(frame, f"Valid Entries: {self.entry_count}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
+
         door_coords = self.doors[camera_id]
-        cv2.rectangle(frame, 
-                    (int(door_coords[0][0]), int(door_coords[0][1])),
-                    (int(door_coords[1][0]), int(door_coords[1][1])),
-                    (255, 0, 255), 2)  # Magenta for door area
-                    
+        cv2.rectangle(frame,
+                      (int(door_coords[0][0]), int(door_coords[0][1])),
+                      (int(door_coords[1][0]), int(door_coords[1][1])),
+                      (255, 0, 255), 2)  # Magenta for door area
+
         return frame
-    
-    def save_tracking_data(self, output_dir):
-        """Save tracking data to CSV files"""
-        # Create output directory if it doesn't exist
+
+    def extract_date_from_filename(self, filename):
+        """Extract date from filename format Camera_X_YYYYMMDD"""
+        try:
+            # Extract the date part from the filename
+            date_str = str(filename).split(
+                '_')[-1].split('.')[0]  # Get YYYYMMDD part
+            return date_str
+        except:
+            return None
+
+    def save_tracking_data(self, output_dir, date):
+        """Save tracking data to CSV files with date information"""
         os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         # Save individual entries data
-        entries_file = os.path.join(output_dir, f'entries_{timestamp}.csv')
+        entries_file = os.path.join(output_dir, f'entries_{date}.csv')
         with open(entries_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Person_ID', 'Camera_ID', 'Entry_Time', 'Exit_Time', 
+            writer.writerow(['Date', 'Person_ID', 'Camera_ID', 'Entry_Time', 'Exit_Time',
                             'First_Detection_X', 'First_Detection_Y',
-                            'Last_Detection_X', 'Last_Detection_Y'])
-            
-            for person_id, camera_data in self.camera_appearances.items():
-                for camera_id, (entry_time, exit_time) in camera_data.items():
-                    # Get first and last positions
-                    person_info = self.tracked_individuals.get(person_id)
-                    if person_info and person_info.prev_positions:
+                             'Last_Detection_X', 'Last_Detection_Y'])
+
+            for person_id, person_info in self.tracked_individuals.items():
+                for camera_id, times in person_info.camera_times.items():
+                    if person_info.prev_positions:
                         first_pos = person_info.prev_positions[0][0]
                         last_pos = person_info.prev_positions[-1][0]
                         writer.writerow([
+                            date,
                             person_id,
                             camera_id,
-                            f"{entry_time:.2f}",
-                            f"{exit_time:.2f}",
+                            f"{times['first']:.2f}",
+                            f"{times['last']:.2f}",
                             f"{first_pos[0]:.1f}",
                             f"{first_pos[1]:.1f}",
                             f"{last_pos[0]:.1f}",
                             f"{last_pos[1]:.1f}"
                         ])
-        
+
         # Save camera transitions data
-        transitions_file = os.path.join(output_dir, f'camera_transitions_{timestamp}.csv')
+        transitions_file = os.path.join(
+            output_dir, f'camera_transitions_{date}.csv')
         with open(transitions_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Person_ID', 'Camera1_Entry', 'Camera1_Exit',
+            writer.writerow(['Date', 'Person_ID', 'Camera1_Entry', 'Camera1_Exit',
                             'Camera2_Entry', 'Camera2_Exit', 'Transit_Time_Seconds'])
-            
-            camera_matches = self.track_between_cameras()
-            for person_id, time1, time2 in camera_matches:
-                # Get full appearance times for both cameras
-                camera1_times = self.camera_appearances[person_id].get('camera1', (None, None))
-                camera2_times = self.camera_appearances[person_id].get('camera2', (None, None))
-                
-                if camera1_times[0] is not None and camera2_times[0] is not None:
-                    transit_time = camera2_times[0] - camera1_times[1]
-                    writer.writerow([
-                        person_id,
-                        f"{camera1_times[0]:.2f}",
-                        f"{camera1_times[1]:.2f}",
-                        f"{camera2_times[0]:.2f}",
-                        f"{camera2_times[1]:.2f}",
-                        f"{transit_time:.2f}"
-                    ])
-        
+
+            for person_id in self.camera1_to_camera2:
+                person_info = self.tracked_individuals.get(person_id)
+                if person_info:
+                    camera1_times = person_info.camera_times.get(
+                        'camera1', {'first': None, 'last': None})
+                    camera2_times = person_info.camera_times.get(
+                        'camera2', {'first': None, 'last': None})
+
+                    if camera1_times['last'] is not None and camera2_times['first'] is not None:
+                        transit_time = camera2_times['first'] - \
+                            camera1_times['last']
+                        writer.writerow([
+                            date,
+                            person_id,
+                            f"{camera1_times['first']:.2f}",
+                            f"{camera1_times['last']:.2f}",
+                            f"{camera2_times['first']:.2f}",
+                            f"{camera2_times['last']:.2f}",
+                            f"{transit_time:.2f}"
+                        ])
+
         # Save summary statistics
-        summary_file = os.path.join(output_dir, f'tracking_summary_{timestamp}.csv')
+        summary_file = os.path.join(output_dir, f'tracking_summary_{date}.csv')
         with open(summary_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Metric', 'Value'])
-            writer.writerow(['Total_Camera1_Entries', sum(1 for data in self.camera_appearances.values() 
-                                                        if 'camera1' in data)])
-            writer.writerow(['Total_Camera2_Entries', sum(1 for data in self.camera_appearances.values() 
-                                                        if 'camera2' in data)])
-            writer.writerow(['Camera1_to_Camera2_Transitions', len(camera_matches)])
-            
-            # Calculate average transit time
-            transit_times = [time2 - time1 for _, time1, time2 in camera_matches]
-            if transit_times:
-                avg_transit = sum(transit_times) / len(transit_times)
-                writer.writerow(['Average_Transit_Time_Seconds', f"{avg_transit:.2f}"])
-        
-        return entries_file, transitions_file, summary_file
+            writer.writerow(['Date', 'Metric', 'Value'])
+            writer.writerow([date, 'Total_Camera1_Entries',
+                            len(self.camera1_entries)])
+            writer.writerow([date, 'Total_Camera2_Entries',
+                            len(set(pid for pid, info in self.tracked_individuals.items()
+                                if 'camera2' in info.camera_times))])
+            writer.writerow(
+                [date, 'Camera1_to_Camera2_Transitions', len(self.camera1_to_camera2)])
 
     def process_videos(self, video_dir, output_dir=None):
-        """Process all videos and save tracking data"""
+        """Process videos grouped by date"""
         if output_dir is None:
             output_dir = os.path.join(video_dir, 'tracking_results')
-            
-        for video_file in sorted(Path(video_dir).glob("Camera_*_*.mp4")):
-            camera_id = "camera1" if "Camera_1" in str(video_file) else "camera2"
-            
-            cap = cv2.VideoCapture(str(video_file))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                processed_frame = self.process_frame(frame, camera_id, timestamp)
-                
-                # Show real-time feedback
-                cv2.imshow(f"Camera {camera_id}", processed_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                    
-            cap.release()
-        
+
+        # Group videos by date
+        videos_by_date = defaultdict(list)
+        for video_file in Path(video_dir).glob("Camera_*_*.mp4"):
+            date = self.extract_date_from_filename(video_file)
+            if date:
+                videos_by_date[date].append(video_file)
+
+        # Process each date's videos separately
+        for date, video_files in videos_by_date.items():
+            # Reset tracking for each date
+            self.reset_tracking()
+
+            print(f"\nProcessing videos for date: {date}")
+
+            # Process each camera's video for this date
+            # Sort to ensure Camera_1 processes first
+            for video_file in sorted(video_files):
+                camera_id = "camera1" if "Camera_1" in str(
+                    video_file) else "camera2"
+                print(f"Processing {video_file}")
+
+                cap = cv2.VideoCapture(str(video_file))
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                    processed_frame = self.process_frame(
+                        frame, camera_id, timestamp)
+
+                    # Show real-time feedback
+                    cv2.imshow(f"Camera {camera_id}", processed_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+                cap.release()
+
+            # Save results for this date
+            if output_dir:
+                self.save_tracking_data(output_dir, date)
+
         cv2.destroyAllWindows()
-        
-        # Save tracking data after processing all videos
-        if output_dir:
-            entries_file, transitions_file, summary_file = self.save_tracking_data(output_dir)
-            print(f"\nTracking data saved:")
-            print(f"Entries data: {entries_file}")
-            print(f"Transitions data: {transitions_file}")
-            print(f"Summary data: {summary_file}")
-    
+
     def validate_intercamera_timing(self, first_camera_time, second_camera_time):
         """Validate the timing between camera appearances"""
         time_diff = second_camera_time - first_camera_time
@@ -719,13 +749,13 @@ class PersonTracker:
     def analyze_tracks(self):
         """Analyze tracking results"""
         camera_matches = self.track_between_cameras()
-        
+
         results = {
             'total_unique_individuals': len(self.tracked_individuals) - len(self.completed_tracks),
             'total_entries': self.entry_count,
             'camera1_entries': len(self.camera1_entries),
-            'camera2_entries': len(set(pid for pid, info in self.tracked_individuals.items() 
-                                    if 'camera2' in info.camera_times)),
+            'camera2_entries': len(set(pid for pid, info in self.tracked_individuals.items()
+                                       if 'camera2' in info.camera_times)),
             'camera1_to_camera2_count': len(self.camera1_to_camera2),
             'camera1_to_camera2_ids': list(self.camera1_to_camera2),
             'transitions': [
@@ -738,15 +768,26 @@ class PersonTracker:
                 if pid in self.tracked_individuals
             ]
         }
-        
+
         # Calculate average transit time for valid transitions
-        valid_transitions = [t for t in results['transitions'] 
-                            if t['camera1_exit'] is not None and t['camera2_entry'] is not None]
+        valid_transitions = [t for t in results['transitions']
+                             if t['camera1_exit'] is not None and t['camera2_entry'] is not None]
         if valid_transitions:
-            transit_times = [(t['camera2_entry'] - t['camera1_exit']) for t in valid_transitions]
-            results['average_transit_time'] = sum(transit_times) / len(transit_times)
-        
+            transit_times = [(t['camera2_entry'] - t['camera1_exit'])
+                             for t in valid_transitions]
+            results['average_transit_time'] = sum(
+                transit_times) / len(transit_times)
+
         return results
+
+    def reset_tracking(self):
+        """Reset tracking states for new date"""
+        self.tracked_individuals.clear()
+        self.completed_tracks.clear()
+        self.current_frame_detections.clear()
+        self.camera1_entries.clear()
+        self.camera1_to_camera2.clear()
+        self.entry_count = 0
 
 class PersonInfo:
     def __init__(self, person_id):
@@ -757,7 +798,7 @@ class PersonInfo:
         self.last_position = None
         self.last_seen = None
         self.last_camera = None
-        
+
         # Entry/Exit tracking
         self.entry_recorded = False
         self.exit_recorded = False
@@ -770,10 +811,11 @@ class PersonInfo:
     def update_appearance(self, image):
         """Store appearance image"""
         if image.size > 0:  # Only store valid images
-            self.appearances.append(image.copy())  # Store a copy to prevent reference issues
+            # Store a copy to prevent reference issues
+            self.appearances.append(image.copy())
             if len(self.appearances) > 10:  # Keep last 10 appearances
                 self.appearances.pop(0)
-                
+
     def update_features(self, new_features):
         """Store multiple features for better matching"""
         feat = np.array(new_features).flatten()
@@ -781,7 +823,7 @@ class PersonInfo:
         self.features.append(feat)
         if len(self.features) > 10:  # Keep more feature history
             self.features.pop(0)
-            
+
     def get_average_features(self):
         """Get average of recent features"""
         if not self.features:
@@ -789,7 +831,7 @@ class PersonInfo:
         # Stack features and compute mean
         stacked_features = np.vstack(self.features)
         return np.mean(stacked_features, axis=0)
-    
+
     def update_position(self, bbox, timestamp):
         """Update position with timestamp"""
         center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
@@ -799,10 +841,13 @@ class PersonInfo:
         self.last_position = center
         self.last_seen = timestamp
         return True
-
+    
 tracker = PersonTracker()
 video_dir = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
                          'Documents', 'VISIONARY', 'Durham Experiment', 'Experiment Data', 'Before')
+
+# video_dir = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
+#                          'Documents', 'VISIONARY', 'Durham Experiment', 'test_data')
 
 try:
     tracker.process_videos(video_dir)
