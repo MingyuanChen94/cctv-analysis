@@ -12,6 +12,7 @@ import logging
 from collections import defaultdict
 import logging
 from ultralytics import YOLO
+from bytetracker import BYTETracker
 
 class PersonTracker: 
     def __init__(self):
