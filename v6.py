@@ -14,10 +14,121 @@ import scipy.spatial.distance as distance
 from pathlib import Path
 import shutil
 import json
+from torchvision import transforms
+import filterpy.kalman
+from filterpy.kalman import KalmanFilter
+from collections import deque
+from scipy.optimize import linear_sum_assignment
 
 # Set the working directory
 working_directory = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
                                  'Documents', 'VISIONARY', 'Durham Experiment', 'test_data')
+
+# Constants for tracking
+KALMAN_AVAILABLE = True  # Since we're importing filterpy
+
+def joint_tracks(tlista, tlistb):
+    """Join two track lists"""
+    exists = {}
+    res = []
+    for t in tlista:
+        exists[t.track_id] = 1
+        res.append(t)
+    for t in tlistb:
+        tid = t.track_id
+        if not exists.get(tid, 0):
+            exists[tid] = 1
+            res.append(t)
+    return res
+
+def sub_tracks(tlista, tlistb):
+    """Remove tracks in b from a"""
+    tracks = {}
+    for t in tlistb:
+        tracks[t.track_id] = t
+    
+    res = []
+    for t in tlista:
+        if not tracks.get(t.track_id, None):
+            res.append(t)
+    return res
+
+def remove_duplicate_tracks(tracks_a, tracks_b):
+    """Remove duplicate tracks based on IOU"""
+    pdist = iou_distance(tracks_a, tracks_b)
+    pairs = np.where(pdist < 0.15)
+    dupa, dupb = [], []
+    
+    for p, q in zip(*pairs):
+        timep = tracks_a[p].frame_id - tracks_a[p].start_frame
+        timeq = tracks_b[q].frame_id - tracks_b[q].start_frame
+        if timep > timeq:
+            dupb.append(q)
+        else:
+            dupa.append(p)
+            
+    resa = [t for i, t in enumerate(tracks_a) if i not in dupa]
+    resb = [t for i, t in enumerate(tracks_b) if i not in dupb]
+    return resa, resb
+
+def iou_distance(atracks, btracks):
+    """Compute IOU distance matrix between a and b tracks"""
+    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or \
+        (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
+        atlbrs = atracks
+        btlbrs = btracks
+    else:
+        atlbrs = [track.tlbr for track in atracks]
+        btlbrs = [track.tlbr for track in btracks]
+
+    _ious = np.zeros((len(atlbrs), len(btlbrs)))
+    
+    if _ious.size > 0:
+        for i, atlbr in enumerate(atlbrs):
+            for j, btlbr in enumerate(btlbrs):
+                _ious[i, j] = calculate_iou(atlbr, btlbr)
+    
+    # Convert IOU to distance
+    dist = 1 - _ious
+    return dist
+
+def gate_cost_matrix(cost_matrix, tracks, detections, track_indices=None, 
+                     detection_indices=None, track_buffer=30):
+    """Gate cost matrix based on track age"""
+    if track_indices is None:
+        track_indices = np.arange(len(tracks))
+    if detection_indices is None:
+        detection_indices = np.arange(len(detections))
+        
+    gated_cost = np.inf * np.ones_like(cost_matrix)
+    for row, track_idx in enumerate(track_indices):
+        track = tracks[track_idx]
+        gating_distance = track_buffer
+        for col, det_idx in enumerate(detection_indices):
+            if cost_matrix[row, col] < gating_distance:
+                gated_cost[row, col] = cost_matrix[row, col]
+    
+    return gated_cost
+
+def calculate_iou(box1, box2):
+    """Calculate IOU between two boxes"""
+    # Convert boxes to correct format if needed
+    if isinstance(box1, np.ndarray):
+        box1 = box1.flatten()
+    if isinstance(box2, np.ndarray):
+        box2 = box2.flatten()
+        
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = box1_area + box2_area - intersection
+    
+    return intersection / (union + 1e-6)
 
 class TrackingState:
     ACTIVE = 'active'          # Fully visible
@@ -25,22 +136,291 @@ class TrackingState:
     TENTATIVE = 'tentative'    # New track
     LOST = 'lost'              # Missing too long
 
+class TrackState:
+    NEW = 0
+    TRACKED = 1
+    LOST = 2
+    REMOVED = 3
+
+class KalmanBoxTracker(object):
+    """
+    This class represents the internal state of individual tracked objects observed as bbox.
+    """
+    count = 0
+    def __init__(self, bbox):
+        """
+        Initialize a tracker using initial bounding box
+        """
+        # Handle invalid bounding box
+        z = convert_bbox_to_z(bbox)
+        if z is None:
+            raise ValueError("Invalid bounding box dimensions")
+            
+        # Define constant velocity model
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        self.kf.F = np.array([
+            [1,0,0,0,1,0,0],      # state transition matrix
+            [0,1,0,0,0,1,0],
+            [0,0,1,0,0,0,1],
+            [0,0,0,1,0,0,0],
+            [0,0,0,0,1,0,0],
+            [0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,1]])
+        
+        self.kf.H = np.array([
+            [1,0,0,0,0,0,0],      # measurement function
+            [0,1,0,0,0,0,0],
+            [0,0,1,0,0,0,0],
+            [0,0,0,1,0,0,0]])
+
+        self.kf.R[2:,2:] *= 10.   # measurement noise
+        self.kf.P[4:,4:] *= 1000. # give high uncertainty to the unobservable initial velocities
+        self.kf.P *= 10.
+        self.kf.Q[-1,-1] *= 0.01  # process noise
+        self.kf.Q[4:,4:] *= 0.01
+
+        self.kf.x[:4] = z
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.history = []
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
+        self.last_bbox = bbox
+
+    def predict(self):
+        """
+        Advances the state vector and returns the predicted bounding box estimate
+        """
+        if((self.kf.x[6]+self.kf.x[2])<=0):
+            self.kf.x[6] *= 0.0
+        self.kf.predict()
+        self.age += 1
+        if(self.time_since_update>0):
+            self.hit_streak = 0
+        self.time_since_update += 1
+        self.history.append(convert_x_to_bbox(self.kf.x))
+        return self.history[-1]
+    
+    def get_state(self):
+        """Returns the current bounding box estimate as [x,y,w,h]."""
+        ret = self.kf.x[:4].reshape(-1)
+        return [ret.copy()]
+
+    def update(self, bbox):
+        """
+        Updates the state vector with observed bbox.
+        """
+        self.time_since_update = 0
+        self.history = []
+        self.hits += 1
+        self.hit_streak += 1
+        self.kf.update(convert_bbox_to_z(bbox))
+        self.last_bbox = bbox
+
+def convert_bbox_to_z(bbox):
+    """
+    Convert bounding box to KF state vector with error checking
+    """
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    
+    # Add checks for zero dimensions
+    if w <= 0 or h <= 0:
+        return None
+        
+    x = bbox[0] + w/2.
+    y = bbox[1] + h/2.
+    s = w * h    # scale is area
+    r = w / float(h + 1e-6)  # add small epsilon to prevent division by zero
+    
+    return np.array([x, y, s, r]).reshape((4, 1))
+
+def convert_x_to_bbox(x):
+    """
+    Convert KF state vector to bounding box
+    """
+    w = np.sqrt(x[2] * x[3])
+    h = x[2] / w
+    return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2.]).reshape((1,4))
+
+class STrack:
+    _count = 0
+
+    def __init__(self, tlwh, score, features):
+        self._tlwh = np.asarray(tlwh, dtype=np.float32)
+        self.score = score
+        self.features = features
+        self.is_activated = False
+        
+        # Initialize Kalman tracker
+        self.kalman_tracker = KalmanBoxTracker(tlwh)
+        
+        self.tracklet_len = 0
+        self.state = TrackState.NEW
+        self.start_frame = 0
+        self.frame_id = 0
+        self.time_since_update = 0
+        
+        # Use _next_id() to assign track ID
+        self.track_id = self._next_id()
+    
+    @staticmethod
+    def _next_id():
+        STrack._count += 1
+        return STrack._count - 1
+
+    @property
+    def tlwh(self):
+        """Get current position in bounding box format `(top left x, top left y,
+        width, height)`.
+        """
+        return self._tlwh.copy()
+
+    def set_tlwh(self, tlwh):
+        """Safely update the bounding box"""
+        self._tlwh = np.asarray(tlwh, dtype=np.float32)
+    
+    @property
+    def tlbr(self):
+        """Convert bounding box to format `(min x, min y, max x, max y)`"""
+        ret = self.tlwh.copy()
+        ret[2:] += ret[:2]
+        return ret
+
+    def update(self, new_track, frame_id):
+        """Update track state"""
+        self.frame_id = frame_id
+        self.time_since_update = 0
+        
+        # Use set_tlwh instead of direct assignment
+        self.set_tlwh(new_track.tlwh)
+        self.features = new_track.features
+        self.score = new_track.score
+        
+        if self.state == TrackState.NEW:
+            self.state = TrackState.TRACKED
+            self.is_activated = True
+            
+        self.tracklet_len += 1
+
+    def reactivate(self, new_track, frame_id):
+        """Reactivate a lost track"""
+        # Use set_tlwh instead of direct assignment
+        self.set_tlwh(new_track.tlwh)
+        self.features = new_track.features
+        self.score = new_track.score
+        self.tracklet_len = 0
+        self.frame_id = frame_id
+        self.time_since_update = 0
+        self.state = TrackState.TRACKED
+        self.is_activated = True
+
+    def mark_lost(self):
+        """Mark track as lost"""
+        self.state = TrackState.LOST
+
+    def predict(self):
+        """Predict next position using Kalman filter"""
+        if self.kalman_tracker:
+            self.kalman_tracker.predict()
+            predicted_box = self.kalman_tracker.get_state()[0]
+            self.set_tlwh(predicted_box)
+
 class GlobalTracker:
     def __init__(self):
-        self.global_identities = {}  # Map camera-specific IDs to global IDs
-        self.appearance_sequence = {}  # Track sequence of camera appearances
-        self.feature_database = {}  # Store features for cross-camera matching
-        # Different thresholds for different cameras
-        self.similarity_thresholds = {
-            '1': 0.85,  # More strict for complex environment
-            '2': 0.75   # Less strict for cleaner environment
-        }
-        # Store camera-specific feature histories
+        self.global_identities = {}
+        self.appearance_sequence = {}
+        self.feature_database = {}
         self.camera_features = {'1': {}, '2': {}}
+        self.last_seen_times = {}
+        
+        # Adjusted timing windows for transitions between cafe and food shop
+        self.min_transition_time = 30   # minimum 30 seconds (quick walk between locations)
+        self.max_transition_time = 300  # maximum 5 minutes (allowing for browsing)
+        
+        # High matching thresholds
+        self.cross_camera_threshold = 0.85
+        self.consecutive_matches_required = 3
+        
+        # Track consecutive matches
+        self.match_history = {}
+
+        self.reid_model = None  # ReID model for feature extraction
+        self.feature_buffer = defaultdict(list)  # Buffer for feature history
+        self.max_buffer_size = 10
+        self.cross_camera_match_thresh = 0.85
 
     def register_camera_detection(self, camera_id, person_id, features, timestamp):
         """Register a detection from a specific camera"""
-        global_id = self._match_or_create_global_id(camera_id, person_id, features)
+        if isinstance(person_id, STrack):
+            person_id = person_id.track_id
+            
+        global_id = self._match_or_create_global_id(camera_id, person_id, features, timestamp)
+        
+        if global_id not in self.appearance_sequence:
+            self.appearance_sequence[global_id] = []
+        
+        camera_key = f"Camera_{camera_id}"
+        
+        # Only append if this is a new appearance in this camera
+        if not self.appearance_sequence[global_id] or \
+        self.appearance_sequence[global_id][-1]['camera'] != camera_key:
+            self.appearance_sequence[global_id].append({
+                'camera': camera_key,
+                'timestamp': timestamp
+            })
+
+    def _match_or_create_global_id(self, camera_id, person_id, features, timestamp):
+        """Enhanced matching with feature history"""
+        camera_key = f"{camera_id}_{person_id}"
+        
+        if camera_key in self.global_identities:
+            return self.global_identities[camera_key]
+            
+        best_match = None
+        best_score = 0
+        
+        if camera_id == '2':  # Only try cross-camera matching for Camera 2
+            for global_id, stored_features in self.feature_database.items():
+                if global_id in self.camera_features['1']:
+                    time_diff = timestamp - self.last_seen_times.get(global_id, 0)
+                    
+                    if self.min_transition_time <= time_diff <= self.max_transition_time:
+                        # Compare with feature history
+                        feature_scores = []
+                        for hist_features in self.feature_buffer[global_id]:
+                            sim = 1 - distance.cosine(
+                                features.flatten(), 
+                                hist_features.flatten()
+                            )
+                            feature_scores.append(sim)
+                            
+                        # Use average of top 3 similarity scores
+                        if feature_scores:
+                            avg_score = np.mean(sorted(feature_scores)[-3:])
+                            if avg_score > self.cross_camera_match_thresh and avg_score > best_score:
+                                best_match = global_id
+                                best_score = avg_score
+        
+        if best_match is None:
+            best_match = len(self.global_identities)
+            
+        # Update feature history
+        self.feature_buffer[best_match].append(features)
+        if len(self.feature_buffer[best_match]) > self.max_buffer_size:
+            self.feature_buffer[best_match].pop(0)
+            
+        self.global_identities[camera_key] = best_match
+        self.feature_database[best_match] = features
+        self.last_seen_times[best_match] = timestamp
+        
+        return best_match
+
+    def register_camera_detection(self, camera_id, person_id, features, timestamp):
+        """Register a detection from a specific camera"""
+        global_id = self._match_or_create_global_id(camera_id, person_id, features, timestamp)
         
         if global_id not in self.appearance_sequence:
             self.appearance_sequence[global_id] = []
@@ -55,75 +435,42 @@ class GlobalTracker:
                 'timestamp': timestamp
             })
 
-    def _match_or_create_global_id(self, camera_id, person_id, features):
-        """Enhanced matching with camera-specific handling"""
-        camera_key = f"{camera_id}_{person_id}"
-        
-        if camera_key in self.global_identities:
-            return self.global_identities[camera_key]
-            
-        # Get camera-specific threshold
-        threshold = self.similarity_thresholds[camera_id]
-        
-        best_match = None
-        best_score = 0
-        
-        # Compare against features from both cameras
-        for global_id, stored_features in self.feature_database.items():
-            # Calculate similarity with temporal weighting
-            base_similarity = 1 - distance.cosine(features.flatten(), stored_features.flatten())
-            
-            # Apply additional checks for cross-camera matching
-            if camera_id == '2':  # If current detection is in Camera 2
-                if global_id in self.camera_features['1']:  # Check if person was seen in Camera 1
-                    time_diff = time.time() - self.camera_features['1'][global_id]['timestamp']
-                    # Adjust similarity based on reasonable transition time (e.g., few minutes walk)
-                    if 60 <= time_diff <= 300:  # 1-5 minutes transition window
-                        base_similarity *= 1.2  # Boost similarity for reasonable transition times
-                    else:
-                        base_similarity *= 0.8  # Reduce similarity for unlikely transition times
-            
-            if base_similarity > threshold and base_similarity > best_score:
-                best_match = global_id
-                best_score = base_similarity
-        
-        if best_match is None:
-            best_match = len(self.global_identities)
-            self.feature_database[best_match] = features
-            
-        self.global_identities[camera_key] = best_match
-        
-        # Store camera-specific features
-        self.camera_features[camera_id][best_match] = {
-            'features': features,
-            'timestamp': time.time()
-        }
-        
-        return best_match
-
     def analyze_camera_transitions(self):
-        """Analyze transitions between cameras"""
+        """More conservative transition analysis"""
         cam1_to_cam2 = 0
         cam2_to_cam1 = 0
         
+        # Track unique transitions
+        valid_transitions = set()
+        
         for global_id, appearances in self.appearance_sequence.items():
+            if len(appearances) < 2:
+                continue
+                
             # Sort appearances by timestamp
             sorted_appearances = sorted(appearances, key=lambda x: x['timestamp'])
             
-            # Check for sequential appearances
+            # Analyze sequential appearances
             for i in range(len(sorted_appearances) - 1):
                 current = sorted_appearances[i]
                 next_app = sorted_appearances[i + 1]
                 
-                if current['camera'] == 'Camera_1' and next_app['camera'] == 'Camera_2':
-                    cam1_to_cam2 += 1
-                elif current['camera'] == 'Camera_2' and next_app['camera'] == 'Camera_1':
-                    cam2_to_cam1 += 1
+                time_diff = next_app['timestamp'] - current['timestamp']
+                
+                if (self.min_transition_time <= time_diff <= self.max_transition_time and
+                    (current['camera'], next_app['camera'], global_id) not in valid_transitions):
+                    
+                    if current['camera'] == 'Camera_1' and next_app['camera'] == 'Camera_2':
+                        cam1_to_cam2 += 1
+                        valid_transitions.add((current['camera'], next_app['camera'], global_id))
+                    elif current['camera'] == 'Camera_2' and next_app['camera'] == 'Camera_1':
+                        cam2_to_cam1 += 1
+                        valid_transitions.add((current['camera'], next_app['camera'], global_id))
         
         return {
             'camera1_to_camera2': cam1_to_cam2,
             'camera2_to_camera1': cam2_to_cam1,
-            'total_unique_individuals': len(self.global_identities)
+            'total_unique_individuals': len(set(self.global_identities.values()))
         }
 
 # Modify the main function to use GlobalTracker
@@ -217,7 +564,7 @@ class PersonTracker:
         # Initialize models
         self.detector = YOLO("yolo11x.pt")
         self.reid_model = torchreid.models.build_model(
-            name='osnet_x1_0',
+            name='osnet_ain_x1_0',
             num_classes=1000,
             pretrained=True
         )
@@ -247,49 +594,95 @@ class PersonTracker:
 
         # Tracking parameters
         self.max_disappeared = self.fps * 2  # Max frames to keep track without detection
-         # Extract camera ID from video path
+        # Extract camera ID from video path
         self.camera_id = Path(video_path).stem.split('_')[1]
         
-        # Camera-specific parameters
-        if self.camera_id == '1':
-            self.min_detection_confidence = 0.7  # Higher threshold for noisy environment
-            self.similarity_threshold = 0.8
-            self.feature_weight = 0.6    # More weight on appearance
-            self.position_weight = 0.2    # Less weight on position
-            self.motion_weight = 0.2      # Less weight on motion
-        else:  # Camera 2
-            self.min_detection_confidence = 0.5  # Lower threshold for cleaner environment
-            self.similarity_threshold = 0.7
-            self.feature_weight = 0.5
+        # Significantly different parameters for cafe vs food shop
+        if self.camera_id == '1':  # Cafe
+            self.min_detection_confidence = 0.85
+            self.similarity_threshold = 0.9
+            self.feature_weight = 0.7
+            self.position_weight = 0.2
+            self.motion_weight = 0.1
+            # Allow for much longer disappearance in cafe (up to 30 minutes)
+            self.max_disappeared = self.fps * 60 * 30  # 30 minutes at 6fps
+            # Extended lost track memory for cafe
+            self.max_lost_age = self.fps * 60 * 45  # 45 minutes
+        else:  # Food shop
+            self.min_detection_confidence = 0.8
+            self.similarity_threshold = 0.85
+            self.feature_weight = 0.6
             self.position_weight = 0.25
-            self.motion_weight = 0.25
+            self.motion_weight = 0.15
+            # Shorter but still significant disappearance allowance for food shop
+            self.max_disappeared = self.fps * 60 * 5  # 5 minutes at 6fps
+            # Lost track memory for food shop
+            self.max_lost_age = self.fps * 60 * 7  # 7 minutes
+
+        # Add additional parameters for handling long-term disappearances
+        self.appearance_confidence = {}  # Track confidence in identifications
+        self.min_reappearance_confidence = 0.95  # Higher confidence needed for long disappearances
+
+        # ByteTrack-specific parameters
+        self.track_thresh = 0.5
+        self.high_thresh = 0.6
+        self.match_thresh = 0.8
+        self.track_buffer = 90
+        
+        # Track states and buffers
+        self.tracked_tracks = []
+        self.lost_tracks = []
+        self.removed_tracks = []
+        self.frame_id = 0
+        
+        # Initialize Kalman filter tracking
+        self.kalman_trackers = []
+        self.track_id_count = 0
+
+    def multi_predict(self, tracks):
+        """Predict next positions for multiple tracks"""
+        for track in tracks:
+            if hasattr(track, 'kalman_tracker'):
+                track.kalman_tracker.predict()
 
     def extract_features(self, person_crop):
-        """Enhanced feature extraction with preprocessing"""
+        """Enhanced feature extraction with better preprocessing"""
         try:
-            # Enhanced preprocessing for different camera environments
-            if self.camera_id == '1':
-                # Apply additional preprocessing for noisy environment
-                person_crop = cv2.GaussianBlur(person_crop, (3, 3), 0)
-                person_crop = cv2.equalizeHist(cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY))
-                person_crop = cv2.cvtColor(person_crop, cv2.COLOR_GRAY2BGR)
+            # Enhanced preprocessing
+            person_crop = cv2.resize(person_crop, (128, 256))
             
-            # Normalize image
-            img = cv2.resize(person_crop, (128, 256))
-            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+            # Apply contrast enhancement
+            lab = cv2.cvtColor(person_crop, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            cl = clahe.apply(l)
+            enhanced = cv2.merge((cl,a,b))
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
             
-            # Convert to tensor and extract features
+            # Normalize
+            img = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX)
+            
+            # Convert to tensor
             img = torch.from_numpy(img).float()
             img = img.permute(2, 0, 1).unsqueeze(0)
+            
+            # Normalize with ImageNet stats
+            normalize = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+            img = normalize(img/255.0)
+            
             if torch.cuda.is_available():
                 img = img.cuda()
                 
+            # Extract features
             with torch.no_grad():
                 features = self.reid_model(img)
+                features = torch.nn.functional.normalize(features, p=2, dim=1)
                 
-            # Apply feature normalization
-            features = torch.nn.functional.normalize(features, p=2, dim=1)
             return features.cpu().numpy()
+            
         except Exception as e:
             print(f"Error extracting features: {e}")
             return None
@@ -299,27 +692,41 @@ class PersonTracker:
         return [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]
     
     def filter_detection(self, box, conf, frame_shape):
-        """Filter out likely false detections"""
+        """Much stricter filtering of detections"""
         height, width = frame_shape[:2]
         box_width = box[2] - box[0]
         box_height = box[3] - box[1]
         
-        # Filter based on camera-specific criteria
+        # Stricter size constraints for both cameras
         if self.camera_id == '1':
-            # More strict filtering for noisy environment
-            if (box_width < width * 0.02 or  # Too small
-                box_width > width * 0.5 or   # Too large
-                box_height < height * 0.1 or # Too short
-                box_height > height * 0.9):  # Too tall
-                return False
+            # Minimum size thresholds
+            min_width_ratio = 0.05
+            min_height_ratio = 0.15
+            # Maximum size thresholds
+            max_width_ratio = 0.3
+            max_height_ratio = 0.8
         else:
-            # Less strict filtering for Camera 2
-            if (box_width < width * 0.01 or
-                box_width > width * 0.6 or
-                box_height < height * 0.05 or
-                box_height > height * 0.95):
-                return False
-                
+            # Slightly different thresholds for Camera 2
+            min_width_ratio = 0.04
+            min_height_ratio = 0.12
+            max_width_ratio = 0.35
+            max_height_ratio = 0.85
+        
+        # Check size constraints
+        width_ratio = box_width / width
+        height_ratio = box_height / height
+        
+        if (width_ratio < min_width_ratio or 
+            width_ratio > max_width_ratio or 
+            height_ratio < min_height_ratio or 
+            height_ratio > max_height_ratio):
+            return False
+        
+        # Check aspect ratio (height should be greater than width for standing people)
+        aspect_ratio = box_height / box_width
+        if aspect_ratio < 1.5 or aspect_ratio > 4.0:  # Typical human proportions
+            return False
+            
         return True
 
     def calculate_velocity(self, current_box, previous_box):
@@ -417,43 +824,48 @@ class PersonTracker:
         return is_occluded, occlusion_score
 
     def calculate_similarity_matrix(self, current_features, current_boxes, tracked_features, tracked_boxes):
-        """Calculate similarity matrix combining appearance, position, and motion"""
+        """Enhanced similarity calculation with better motion modeling"""
         n_detections = len(current_features)
         n_tracks = len(tracked_features)
 
         if n_detections == 0 or n_tracks == 0:
             return np.array([])
 
-        # Calculate appearance similarity
+        # Calculate appearance similarity with cosine distance
         appearance_sim = 1 - distance.cdist(
             np.array([f.flatten() for f in current_features]),
             np.array([f.flatten() for f in tracked_features]),
             metric='cosine'
         )
 
-        # Calculate position similarity using IoU
+        # Enhanced motion-based similarity
+        motion_sim = np.zeros((n_detections, n_tracks))
+        for i, current_box in enumerate(current_boxes):
+            current_center = self.calculate_box_center(current_box)
+            
+            for j, (tracked_box, track_id) in enumerate(zip(tracked_boxes, list(self.active_tracks.keys())[:n_tracks])):
+                if 'velocity' in self.active_tracks[track_id]:
+                    predicted_box = self.predict_next_position(
+                        tracked_box,
+                        self.active_tracks[track_id]['velocity']
+                    )
+                    predicted_center = self.calculate_box_center(predicted_box)
+                    
+                    # Calculate distance between prediction and actual position
+                    distance = np.sqrt(
+                        (current_center[0] - predicted_center[0])**2 +
+                        (current_center[1] - predicted_center[1])**2
+                    )
+                    # Convert distance to similarity score
+                    motion_sim[i, j] = np.exp(-distance / 100.0)
+
+        # Enhanced position similarity using GIoU
         position_sim = np.zeros((n_detections, n_tracks))
         for i, box1 in enumerate(current_boxes):
             for j, box2 in enumerate(tracked_boxes):
-                position_sim[i, j] = self.calculate_iou(box1, box2)
+                position_sim[i, j] = self.calculate_giou(box1, box2)
 
-        # Calculate velocities for tracked objects
-        tracked_velocities = []
-        for track_id in list(self.active_tracks.keys())[:n_tracks]:
-            if 'previous_box' in self.active_tracks[track_id]:
-                velocity = self.calculate_velocity(
-                    self.active_tracks[track_id]['box'],
-                    self.active_tracks[track_id]['previous_box']
-                )
-            else:
-                velocity = [0, 0]  # No velocity for new tracks
-            tracked_velocities.append(velocity)
-
-        # Calculate motion similarity
-        motion_sim = self.calculate_motion_similarity(
-            current_boxes, tracked_boxes, tracked_velocities)
-
-        # Combine all similarities
+        # Combine similarities with dynamic weighting
         similarity_matrix = (
             self.feature_weight * appearance_sim +
             self.position_weight * position_sim +
@@ -464,18 +876,29 @@ class PersonTracker:
 
     @staticmethod
     def calculate_iou(box1, box2):
-        """Calculate IoU between two boxes"""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
-
-        return intersection / (union + 1e-6)
+        """Calculate IOU between two boxes with error checking"""
+        try:
+            # Convert boxes to correct format if needed
+            if isinstance(box1, np.ndarray):
+                box1 = box1.flatten()
+            if isinstance(box2, np.ndarray):
+                box2 = box2.flatten()
+                
+            x1 = max(box1[0], box2[0])
+            y1 = max(box1[1], box2[1])
+            x2 = min(box1[2], box2[2])
+            y2 = min(box1[3], box2[3])
+            
+            intersection = max(0, x2 - x1) * max(0, y2 - y1)
+            box1_area = max(0.1, (box1[2] - box1[0]) * (box1[3] - box1[1]))
+            box2_area = max(0.1, (box2[2] - box2[0]) * (box2[3] - box2[1]))
+            union = box1_area + box2_area - intersection
+            
+            return intersection / (union + 1e-6)  # add small epsilon to prevent division by zero
+            
+        except Exception as e:
+            print(f"Error calculating IOU: {str(e)}")
+            return 0.0
 
     def update_feature_history(self, track_id, features):
         """Maintain rolling window of recent features"""
@@ -682,105 +1105,255 @@ class PersonTracker:
 
         return results
 
-    def update_tracks(self, frame, detections, frame_time):
-        """Update tracks with new detections, handling reentries"""
-        current_boxes = []
-        current_features = []
-
-        # Process new detections
+    def _process_detections(self, detections, frame):
+        """Process and split detections into high and low confidence with error handling"""
+        high_dets = []
+        low_dets = []
+        
         for box, conf in detections:
-            # Add filter_detection check here
-            if not self.filter_detection(box, conf, frame.shape):
+            try:
+                if not self.filter_detection(box, conf, frame.shape):
+                    continue
+                    
+                x1, y1, x2, y2 = map(int, box)
+                # Add checks for valid box dimensions
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                    
+                person_crop = frame[y1:y2, x1:x2]
+                if person_crop.size == 0:
+                    continue
+                    
+                features = self.extract_features(person_crop)
+                if features is not None:
+                    # Convert to TLWH format with width and height
+                    tlwh = [x1, y1, x2-x1, y2-y1]
+                    
+                    # Add checks for valid dimensions
+                    if tlwh[2] <= 0 or tlwh[3] <= 0:
+                        continue
+                        
+                    if conf >= self.high_thresh:
+                        try:
+                            track = STrack(tlwh, conf, features)
+                            high_dets.append(track)
+                        except ValueError:
+                            continue
+                    elif conf >= self.track_thresh:
+                        try:
+                            track = STrack(tlwh, conf, features)
+                            low_dets.append(track)
+                        except ValueError:
+                            continue
+                            
+            except Exception as e:
+                print(f"Error processing detection: {str(e)}")
                 continue
+        
+        return high_dets, low_dets
+    
+    def _match_high_confidence(self, tracks, detections):
+        """Match tracks with high confidence detections"""
+        if len(tracks) == 0 or len(detections) == 0:
+            return [], list(range(len(tracks))), list(range(len(detections)))
                 
-            if conf < self.min_detection_confidence:
-                continue
+        cost_matrix = self._get_cost_matrix(tracks, detections)
+        cost_matrix = gate_cost_matrix(
+            cost_matrix, tracks, detections, track_buffer=self.track_buffer)
+                
+        row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+        matched_indices = list(zip(row_ind, col_ind))
+        
+        # Get unmatched tracks and detections
+        unmatched_tracks = list(set(range(len(tracks))) - set(row_ind))
+        unmatched_detections = list(set(range(len(detections))) - set(col_ind))
+        
+        # Filter matches with low similarity
+        matches = []
+        for row, col in matched_indices:
+            if cost_matrix[row, col] > self.match_thresh:
+                unmatched_tracks.append(row)
+                unmatched_detections.append(col)
+            else:
+                matches.append((row, col))
+        
+        return matches, unmatched_tracks, unmatched_detections
+        
+    def _get_cost_matrix(self, tracks, detections):
+        """Calculate cost matrix between tracks and detections"""
+        cost_matrix = np.zeros((len(tracks), len(detections)))
+        
+        for i, track in enumerate(tracks):
+            for j, det in enumerate(detections):
+                # Appearance similarity
+                reid_sim = 1 - distance.cosine(
+                    track.features.flatten(),
+                    det.features.flatten()
+                )
+                # Motion similarity
+                iou_sim = self.calculate_iou(track.tlbr, det.tlbr)
+                # Combined similarity
+                cost_matrix[i, j] = -(
+                    self.feature_weight * reid_sim +
+                    (1 - self.feature_weight) * iou_sim
+                )
+                
+        return cost_matrix
 
-            x1, y1, x2, y2 = map(int, box)
-            person_crop = frame[y1:y2, x1:x2]
-            if person_crop.size == 0:
-                continue
+    def update_tracks(self, frame, detections, frame_time):
+        """ByteTrack-inspired track updating"""
+        self.frame_id += 1
+        activated_tracks = []
+        refined_tracks = []
+        lost_tracks = []
+        removed_tracks = []
+        
+        # Get detections
+        high_dets, low_dets = self._process_detections(detections, frame)
+        
+        # First association with high score detections
+        track_pool = joint_tracks(self.tracked_tracks, self.lost_tracks)
+        self.multi_predict(track_pool)
+        
+        # Match with high confidence detections - now using only three return values
+        matches, unmatched_tracks, unmatched_detections = self._match_high_confidence(
+            track_pool, high_dets)
+            
+        # Process matches
+        for track_idx, det_idx in matches:
+            track = track_pool[track_idx]
+            det = high_dets[det_idx]
+            
+            if track.state == TrackState.TRACKED:
+                track.update(det, self.frame_id)
+                activated_tracks.append(track)
+            else:
+                track.reactivate(det, self.frame_id)
+                refined_tracks.append(track)
 
-            features = self.extract_features(person_crop)
-            if features is not None:
-                current_boxes.append([x1, y1, x2, y2])
-                current_features.append(features)
+        # Second association with low score detections
+        if len(unmatched_tracks) > 0 and len(low_dets) > 0:
+            # Match low confidence detections
+            matches_low, unmatched_tracks_low, _ = self._match_high_confidence(
+                [track_pool[i] for i in unmatched_tracks], 
+                low_dets)
+            
+            for track_idx, det_idx in matches_low:
+                track = track_pool[unmatched_tracks[track_idx]]
+                det = low_dets[det_idx]
+                
+                if track.state == TrackState.TRACKED:
+                    track.update(det, self.frame_id)
+                    activated_tracks.append(track)
+                else:
+                    track.reactivate(det, self.frame_id)
+                    refined_tracks.append(track)
+            
+            unmatched_tracks = unmatched_tracks_low
 
-        # Match with active tracks first
+        # Update lost tracks
+        for track_idx in unmatched_tracks:
+            track = track_pool[track_idx]
+            if track.state == TrackState.TRACKED:
+                track.mark_lost()
+                lost_tracks.append(track)
+        
+        # Update state
+        self.tracked_tracks = [t for t in self.tracked_tracks if t.state == TrackState.TRACKED]
+        self.tracked_tracks = joint_tracks(self.tracked_tracks, activated_tracks)
+        self.tracked_tracks = joint_tracks(self.tracked_tracks, refined_tracks)
+        self.lost_tracks = sub_tracks(self.lost_tracks, self.tracked_tracks)
+        self.lost_tracks.extend(lost_tracks)
+        self.lost_tracks = sub_tracks(self.lost_tracks, self.removed_tracks)
+        self.removed_tracks.extend(removed_tracks)
+        self.tracked_tracks, self.lost_tracks = remove_duplicate_tracks(
+            self.tracked_tracks, self.lost_tracks)
+        
+    def _is_near_predicted_track(self, box):
+        """Check if detection is near any predicted track location"""
+        for track_id, track_info in self.active_tracks.items():
+            if 'velocity' in track_info:
+                predicted_box = self.predict_next_position(
+                    track_info['box'], track_info['velocity'])
+                iou = self.calculate_iou(box, predicted_box)
+                if iou > 0.3:  # Threshold for "near"
+                    return True
+        return False
+
+    def _match_detections(self, boxes, features, scores, frame_time, frame):
+        """Enhanced detection matching with Kalman filtering"""
+        matched_track_ids = set()
+        
+        if not boxes:
+            return matched_track_ids
+            
+        # Get active track information
         tracked_boxes = []
         tracked_features = []
         tracked_ids = []
-
+        
         for track_id, track_info in self.active_tracks.items():
-            tracked_boxes.append(track_info['box'])
+            # Predict new location using Kalman filter
+            predicted_box = self.predict_next_position(
+                track_info['box'], 
+                track_info.get('velocity', [0, 0])
+            )
+            tracked_boxes.append(predicted_box)
             tracked_features.append(track_info['features'])
             tracked_ids.append(track_id)
-
-        # Calculate similarity matrix for active tracks
+        
+        # Calculate similarity matrix
         similarity_matrix = self.calculate_similarity_matrix(
-            current_features, current_boxes,
-            tracked_features, tracked_boxes
-        )
-
-        # Perform matching with active tracks
-        matched_indices = []
+            features, boxes, tracked_features, tracked_boxes)
+        
+        # Perform matching
         if similarity_matrix.size > 0:
             row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
-            matched_indices = list(zip(row_ind, col_ind))
-
-        # Process matches and handle unmatched detections
-        matched_detections = set()
-        matched_track_ids = set()
-
-        for detection_idx, track_idx in matched_indices:
-            similarity = similarity_matrix[detection_idx, track_idx]
-            if similarity >= self.similarity_threshold:
-                track_id = tracked_ids[track_idx]
-                matched_track_ids.add(track_id)
-                matched_detections.add(detection_idx)
-
-                # Update existing track
-                self.update_existing_track(
-                    track_id, 
-                    current_boxes[detection_idx],
-                    current_features[detection_idx],
-                    frame_time,
-                    frame
+            
+            for detection_idx, track_idx in zip(row_ind, col_ind):
+                if similarity_matrix[detection_idx, track_idx] >= self.similarity_threshold:
+                    track_id = tracked_ids[track_idx]
+                    matched_track_ids.add(track_id)
+                    
+                    # Update track with new detection
+                    self.update_existing_track(
+                        track_id,
+                        boxes[detection_idx],
+                        features[detection_idx],
+                        frame_time,
+                        frame
+                    )
+        
+        # Handle unmatched detections
+        for i in range(len(boxes)):
+            if i not in row_ind:
+                # Try to recover lost track first
+                recovered_id = self.recover_lost_tracklet(
+                    features[i],
+                    boxes[i],
+                    frame_time
                 )
-
-        # Try to match remaining detections with lost tracks
-        for detection_idx in range(len(current_features)):
-            if detection_idx in matched_detections:
-                continue
-
-            # Try to recover lost track
-            recovered_id = self.recover_lost_tracklet(
-                current_features[detection_idx],
-                current_boxes[detection_idx],
-                frame_time
-            )
-
-            if recovered_id is not None:
-                # Reactivate recovered track
-                self.reactivate_track(
-                    recovered_id,
-                    current_boxes[detection_idx],
-                    current_features[detection_idx],
-                    frame_time,
-                    frame
-                )
-                matched_detections.add(detection_idx)
-            else:
-                # Create new track
-                self.create_new_track(
-                    current_boxes[detection_idx],
-                    current_features[detection_idx],
-                    frame_time,
-                    frame
-                )
-
-        # Update lost tracks
-        self.update_lost_tracks(matched_track_ids, frame_time)
+                
+                if recovered_id is not None:
+                    self.reactivate_track(
+                        recovered_id,
+                        boxes[i],
+                        features[i],
+                        frame_time,
+                        frame
+                    )
+                    matched_track_ids.add(recovered_id)
+                else:
+                    # Create new track only for high confidence detections
+                    if scores[i] >= self.min_detection_confidence:
+                        self.create_new_track(
+                            boxes[i],
+                            features[i],
+                            frame_time,
+                            frame
+                        )
+        
+        return matched_track_ids
 
     def save_person_image(self, person_id, frame):
         """Save person image in video-specific directory"""
@@ -827,7 +1400,7 @@ class PersonTracker:
 
     def process_video(self):
         frame_count = 0
-
+        
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -838,7 +1411,7 @@ class PersonTracker:
 
             # Detect persons using YOLO
             results = self.detector(frame, classes=[0])  # class 0 is person
-
+            
             # Process detections
             detections = []
             for result in results:
@@ -848,13 +1421,36 @@ class PersonTracker:
 
             # Update tracking
             self.update_tracks(frame, detections, frame_time)
+            
+            # Save tracking information - Add this part
+            for track in self.tracked_tracks:
+                if track.is_activated:
+                    # Update person timestamps
+                    track_id = track.track_id
+                    if track_id not in self.person_timestamps:
+                        self.person_timestamps[track_id] = {
+                            'first_appearance': frame_time,
+                            'last_appearance': frame_time
+                        }
+                    else:
+                        self.person_timestamps[track_id]['last_appearance'] = frame_time
+                    
+                    # Update person features
+                    if track_id not in self.person_features:
+                        self.person_features[track_id] = track.features
+                    
+                    # Save person image
+                    person_img = frame[int(track.tlwh[1]):int(track.tlwh[1]+track.tlwh[3]), 
+                                    int(track.tlwh[0]):int(track.tlwh[0]+track.tlwh[2])]
+                    self.save_person_image(track_id, person_img)
 
             # Visualize results
-            for track_id, track_info in self.active_tracks.items():
-                box = track_info['box']
-                cv2.rectangle(frame, (int(box[0]), int(box[1])),
-                              (int(box[2]), int(box[3])), (0, 255, 0), 2)
-                cv2.putText(frame, f"ID: {track_id}",
+            for track in self.tracked_tracks:
+                if track.is_activated:
+                    box = track.tlbr
+                    cv2.rectangle(frame, (int(box[0]), int(box[1])),
+                                (int(box[2]), int(box[3])), (0, 255, 0), 2)
+                    cv2.putText(frame, f"ID: {track.track_id}",
                             (int(box[0]), int(box[1])-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
