@@ -14,7 +14,7 @@ import scipy.spatial.distance as distance
 from pathlib import Path
 import shutil
 import json
-from bytetracker import ByteTracker
+from ultralytics.trackers.byte_tracker import ByteTracker
 
 # Set the working directory
 working_directory = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
