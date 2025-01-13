@@ -228,19 +228,15 @@ class PersonTracker:
         self.position_weight = 0.25  # Weight for absolute position (IoU)
         self.motion_weight = 0.3    # Weight for relative motion prediction
 
-        # Existing initialization remains the same
         super().__init__()
         
-        # Initialize ByteTrack with optimized parameters
+        # Initialize ByteTrack with correct parameters
         self.byte_tracker = BYTETracker(
-            track_thresh=0.45,     # High-confidence threshold for track initialization
+            track_thresh=0.45,     # Detection confidence threshold
             track_buffer=25,       # Track buffer size (about 4 seconds at 6fps)
             match_thresh=0.8,      # Matching threshold for track association
-            frame_rate=6,          # Video frame rate
-            track_high_thresh=0.6, # Threshold for high-confidence detections
-            track_low_thresh=0.1,  # Threshold for low-confidence detections
-            new_track_thresh=0.7,  # Threshold for creating new tracks
-            match_thresh_second=0.3 # Secondary matching threshold
+            min_box_area=100,      # Minimum box area
+            frame_rate=6           # Frame rate
         )
         
         # Enhanced tracking parameters
@@ -271,6 +267,7 @@ class PersonTracker:
     def filter_detections(self, detections, frame):
         """Enhanced detection filtering"""
         filtered_dets = []
+        
         for box, conf in detections:
             x1, y1, x2, y2 = map(int, box)
             width = x2 - x1
@@ -371,48 +368,52 @@ class PersonTracker:
         # Filter detections
         filtered_dets = self.filter_detections(detections, frame)
         
-        # Convert to ByteTrack format
-        byte_dets = []
-        for box, conf, quality in filtered_dets:
-            x1, y1, x2, y2 = map(int, box)
-            byte_dets.append([x1, y1, x2, y2, conf, 0])
-        byte_dets = np.array(byte_dets)
+        # Convert to ByteTrack format - Update the format to include scores
+        byte_dets = np.array([
+            [*map(int, box), conf, 0]  # [x1, y1, x2, y2, score, class_id]
+            for box, conf, _ in filtered_dets
+        ])
         
-        # Run ByteTrack update
-        online_targets = self.byte_tracker.update(
-            byte_dets,
-            [self.frame_height, self.frame_width],
-            [self.frame_height, self.frame_width]
-        )
-        
-        # Process ByteTrack results with enhanced matching
-        current_tracks = []
-        for t in online_targets:
-            tlwh = t.tlwh
-            tid = t.track_id
+        if len(byte_dets) > 0:
+            # Run ByteTrack update with correct dimension format
+            online_targets = self.byte_tracker.update(
+                byte_dets,
+                [self.frame_height, self.frame_width],
+                [self.frame_height, self.frame_width]
+            )
             
-            if self._is_valid_track(tlwh, t.score):
-                x1, y1, w, h = tlwh
-                box = [x1, y1, x1 + w, y1 + h]
+            # Process ByteTrack results with enhanced matching
+            current_tracks = []
+            for t in online_targets:
+                tlwh = t.tlwh
+                tid = t.track_id
                 
-                # Extract and verify features
-                features = self._extract_and_verify_features(frame, box)
-                if features is not None:
-                    current_tracks.append({
-                        'box': box,
-                        'features': features,
-                        'byte_id': tid,
-                        'score': t.score
-                    })
-        
-        # Update existing tracks
-        self._update_existing_tracks(current_tracks, frame_time, frame)
-        
-        # Handle lost tracks
-        self._handle_lost_tracks(frame_time)
-        
-        # Clean up tracking states
-        self._cleanup_tracking_states()
+                if self._is_valid_track(tlwh, t.score):
+                    x1, y1, w, h = tlwh
+                    box = [x1, y1, x1 + w, y1 + h]
+                    
+                    # Extract and verify features
+                    features = self._extract_and_verify_features(frame, box)
+                    if features is not None:
+                        current_tracks.append({
+                            'box': box,
+                            'features': features,
+                            'byte_id': tid,
+                            'score': t.score
+                        })
+            
+            # Update existing tracks
+            matched_track_ids = self._update_existing_tracks(current_tracks, frame_time, frame)
+            
+            # Handle lost tracks
+            self._handle_lost_tracks(frame_time)
+            
+            # Clean up tracking states
+            self._cleanup_tracking_states()
+        else:
+            # Handle frame with no detections
+            self._handle_lost_tracks(frame_time)
+            self._cleanup_tracking_states()
 
     def _is_valid_track(self, tlwh, score):
         """Validate track based on geometry and score"""
