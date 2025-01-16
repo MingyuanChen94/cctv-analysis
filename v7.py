@@ -30,18 +30,19 @@ class TrackingState:
 
 class GlobalTracker:
     def __init__(self):
-        self.global_identities = {}  # Map camera-specific IDs to global IDs
-        self.appearance_sequence = {}  # Track sequence of camera appearances
-        self.feature_database = {}  # Store features for cross-camera matching
-        self.similarity_threshold = 0.6
-        self.min_transition_time = 30  # Minimum seconds between cameras
-        self.max_transition_time = 600  # Maximum seconds between cameras
+        self.global_identities = {}
+        self.appearance_sequence = {}
+        self.feature_database = {}
+        
+        # Keep strict parameters for cross-camera matching
+        self.similarity_threshold = 0.7
+        self.min_transition_time =  30   # 30 seconds minimum
+        self.max_transition_time = 1200   # 20 minutes maximum
+        self.min_feature_consistency = 0.65
+        
+        # Feature history
         self.feature_history = defaultdict(list)
         self.max_features_per_identity = 5
-
-        # Track validation parameters
-        self.min_track_duration = 2.0    # Minimum 2 seconds for valid track
-        self.feature_consistency_threshold = 0.7
 
     def register_camera_detection(self, camera_id, person_id, features, timestamp):
         """Enhanced registration with temporal consistency"""
@@ -85,7 +86,7 @@ class GlobalTracker:
         return True
 
     def _match_or_create_global_id(self, camera_id, person_id, features, timestamp):
-        """Modified matching with relaxed constraints"""
+        """Stricter cross-camera matching"""
         camera_key = f"{camera_id}_{person_id}"
         
         if camera_key in self.global_identities:
@@ -101,25 +102,44 @@ class GlobalTracker:
                 last_camera = int(last_appearance['camera'].split('_')[1])
                 time_diff = timestamp - last_appearance['timestamp']
                 
-                # Skip if same camera or invalid transition time
-                if last_camera == camera_id or time_diff < self.min_transition_time:
+                # Skip invalid transitions
+                if (last_camera == camera_id or 
+                    time_diff < self.min_transition_time or 
+                    time_diff > self.max_transition_time):
                     continue
                 
-                # Calculate similarity with temporal weighting
+                # Calculate base similarity
                 base_similarity = 1 - distance.cosine(features.flatten(), stored_features.flatten())
                 
-                # Add time-based bonus for realistic transition times
-                time_bonus = 0.2 if self.min_transition_time <= time_diff <= 120 else 0
-                adjusted_similarity = base_similarity + time_bonus
+                # Check feature consistency with history
+                if global_id in self.feature_history and self.feature_history[global_id]:
+                    history_similarities = [
+                        1 - distance.cosine(features.flatten(), hist_feat.flatten())
+                        for hist_feat in self.feature_history[global_id]
+                    ]
+                    consistency = np.mean(history_similarities)
+                    if consistency < self.min_feature_consistency:
+                        continue
                 
-                if adjusted_similarity > self.similarity_threshold and adjusted_similarity > best_score:
+                # Add temporal weight
+                expected_transition = 45  # Expected transition time
+                time_weight = max(0, 1 - abs(time_diff - expected_transition) / expected_transition)
+                final_similarity = base_similarity * (0.8 + 0.2 * time_weight)
+                
+                if final_similarity > self.similarity_threshold and final_similarity > best_score:
                     best_match = global_id
-                    best_score = adjusted_similarity
+                    best_score = final_similarity
         
         if best_match is None:
             best_match = len(self.global_identities)
             self.feature_database[best_match] = features
-            
+            self.feature_history[best_match] = [features]
+        else:
+            # Update feature history
+            self.feature_history[best_match].append(features)
+            if len(self.feature_history[best_match]) > self.max_features_per_identity:
+                self.feature_history[best_match].pop(0)
+        
         self.global_identities[camera_key] = best_match
         return best_match
     
@@ -379,11 +399,21 @@ class PersonTracker:
         self.max_history_length = 10  # Number of recent features to keep
 
         # Modified tracking parameters
-        self.similarity_threshold = 0.65
-        self.min_detection_confidence = 0.5
-        self.feature_weight = 0.6
-        self.position_weight = 0.25
-        self.motion_weight = 0.15
+        self.similarity_threshold = 0.45     # Much more lenient for initial matching
+        self.min_detection_confidence = 0.5 # Lower detection threshold
+        self.feature_weight = 0.6          # Equal weight to features and position
+        self.position_weight = 0.4
+        self.motion_weight = 0.0           # Disable motion weighting temporarily
+        
+        # Track maintenance parameters
+        self.min_track_duration = 1.0      # Very short minimum duration (0.2 seconds)
+        self.max_disappeared = self.fps * 1800 # Longer disappeared time
+        self.track_quality_threshold = 0.5  # Lower quality threshold
+        
+        # New parameters for track splitting and merging
+        self.max_track_gap = self.fps * 1800  # Longer gap allowed
+        self.merge_threshold = 0.55         # Lower threshold for merging
+        self.min_detections = 3            # Minimum detections needed
         self.reentry_threshold = 0.75
 
         # Track consolidation parameters
@@ -395,29 +425,15 @@ class PersonTracker:
         self.min_track_duration = 1.5  # Minimum 1.5 seconds for valid track
         self.stable_track_threshold = self.fps * 5  # 5 seconds for stable track
         
-        # Track quality assessment
-        self.track_quality_threshold = 0.7
-        self.min_detections_for_track = 5
-        self.max_disappeared = self.fps * 2
+        # Add track stability requirements
+        self.min_consecutive_detections = 3  # New parameter
+        self.max_position_jump = 100        # Pixels, new parameter
 
-        # Spatial-temporal parameters for individual counting
-        self.min_spatial_distance = 50  # Minimum pixels between different individuals
-        self.min_temporal_gap = 0.5     # Minimum seconds between appearances
-        self.track_memory = 30          # Remember tracks for this many frames
-        
-        # Track classification
-        self.track_categories = {
-            'entering': [],     # Tracks near door, moving inward
-            'leaving': [],      # Tracks near door, moving outward
-            'inside': [],       # Tracks away from door
-            'temporary': []     # Short-lived or uncertain tracks
-        }
-        
-        # Door region definition remains the same
+        # Camera-specific parameters
         self.camera_id = int(Path(video_path).stem.split('_')[1])
         self.door_coords = {
-            1: [(1030, 0), (1700, 560)],
-            2: [(400, 0), (800, 470)]
+            1: [(1030, 0), (1700, 560)],  # Camera 1 door coordinates
+            2: [(400, 0), (800, 470)]      # Camera 2 door coordinates
         }
         self.door_region_buffer = 50  # pixels buffer around door region
 
@@ -430,43 +446,6 @@ class PersonTracker:
             # More relaxed parameters for Camera 2's cleaner environment
             self.min_detection_confidence = 0.5
             self.consolidation_threshold = 0.75
-
-    def classify_track_location(self, box):
-        """Classify track based on location and movement"""
-        center = self.calculate_box_center(box)
-        door = self.door_coords[self.camera_id]
-        
-        # Check if in door region
-        in_door = (door[0][0] <= center[0] <= door[1][0] and 
-                  door[0][1] <= center[1] <= door[1][1])
-        
-        return 'door' if in_door else 'inside'
-    
-    def is_new_person(self, current_box, current_time):
-        """Determine if this detection likely represents a new person"""
-        # Check spatial separation from all active tracks
-        for track_id, track in self.active_tracks.items():
-            if track['disappeared'] < self.track_memory:
-                dist = np.linalg.norm(
-                    np.array(self.calculate_box_center(current_box)) - 
-                    np.array(self.calculate_box_center(track['box']))
-                )
-                if dist < self.min_spatial_distance:
-                    return False
-                    
-        # Check temporal separation from recent tracks in similar location
-        for track_id, timestamps in self.person_timestamps.items():
-            if current_time - timestamps['last_appearance'] < self.min_temporal_gap:
-                if track_id in self.active_tracks:
-                    track_box = self.active_tracks[track_id]['box']
-                    dist = np.linalg.norm(
-                        np.array(self.calculate_box_center(current_box)) - 
-                        np.array(self.calculate_box_center(track_box))
-                    )
-                    if dist < self.min_spatial_distance:
-                        return False
-                        
-        return True
     
     def consolidate_tracks(self):
         """Merge tracks that likely belong to the same person"""
@@ -922,39 +901,49 @@ class PersonTracker:
                 del self.lost_tracks[track_id]
 
     def save_tracking_results(self):
-        """Save results with corrected counting"""
+        """Save tracking results with corrected structure"""
+        video_date = self.video_name.split('_')[-1]  # Extract date from video name
+        
         results = {
             'video_name': self.video_name,
-            'date': self.video_name.split('_')[-1],
-            'camera_id': self.camera_id,
-            'person_details': {}
+            'date': video_date,
+            'video_metadata': {
+                'width': self.frame_width,
+                'height': self.frame_height,
+                'fps': self.fps
+            },
+            'total_persons': len(self.person_timestamps),
+            'person_details': {}  # Ensure this key exists
         }
         
-        # Count unique individuals based on spatial-temporal separation
-        unique_individuals = set()
-        for track_id, track in self.active_tracks.items():
-            if track['disappeared'] <= self.track_memory:
-                location = self.classify_track_location(track['box'])
-                if location != 'temporary':
-                    unique_individuals.add(track_id)
+        # Process each person's data
+        for person_id, timestamps in self.person_timestamps.items():
+            # Calculate track duration
+            duration = timestamps['last_appearance'] - timestamps['first_appearance']
+            
+            # Only include tracks that meet minimum duration
+            if duration >= self.min_track_duration:
+                results['person_details'][person_id] = {
+                    'first_appearance': timestamps['first_appearance'],
+                    'last_appearance': timestamps['last_appearance'],
+                    'duration': duration,
+                    'appearances': len(self.appearance_history.get(person_id, [])),
+                }
         
-        # Add all valid tracks to results
-        for track_id in unique_individuals:
-            results['person_details'][track_id] = {
-                'first_appearance': self.person_timestamps[track_id]['first_appearance'],
-                'last_appearance': self.active_tracks[track_id]['last_seen'],
-                'duration': (self.active_tracks[track_id]['last_seen'] - 
-                           self.person_timestamps[track_id]['first_appearance'])
-            }
+        # Save results to JSON
+        results_path = os.path.join(self.output_dir, "tracking_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=4)
         
         return results
 
     def update_tracks(self, frame, detections, frame_time):
-        """Modified track updating with improved individual counting"""
+        """Modified update_tracks method with improved track maintenance"""
         current_boxes = []
         current_features = []
+        current_confidences = []
         
-        # Process detections
+        # Process detections with lower threshold
         for box, conf in detections:
             if conf < self.min_detection_confidence:
                 continue
@@ -968,65 +957,172 @@ class PersonTracker:
             if features is not None:
                 current_boxes.append([x1, y1, x2, y2])
                 current_features.append(features)
+                current_confidences.append(conf)
         
-        # Update existing tracks
+        # Match detections to existing tracks
+        matched_tracks = set()
         matched_detections = set()
-        for track_id, track in list(self.active_tracks.items()):
+        
+        # First pass: Match with high confidence
+        for det_idx, (det_features, det_box) in enumerate(zip(current_features, current_boxes)):
             best_match = None
-            best_score = float('-inf')
+            best_score = 0
             
-            # Find best matching detection
-            for i, (box, features) in enumerate(zip(current_boxes, current_features)):
-                if i in matched_detections:
+            for track_id, track in self.active_tracks.items():
+                if track_id in matched_tracks:
                     continue
                     
-                # Calculate spatial similarity
-                dist = np.linalg.norm(
-                    np.array(self.calculate_box_center(box)) - 
-                    np.array(self.calculate_box_center(track['box']))
-                )
-                spatial_score = np.exp(-dist / self.min_spatial_distance)
-                
                 # Calculate feature similarity
-                feature_sim = 1 - distance.cosine(
-                    features.flatten(),
-                    track['features'].flatten()
-                )
+                feature_sim = 1 - distance.cosine(det_features.flatten(), 
+                                                track['features'].flatten())
                 
-                # Combined score
-                score = 0.7 * spatial_score + 0.3 * feature_sim
+                # Calculate position similarity
+                pos_sim = self.calculate_iou(det_box, track['box'])
                 
-                if score > best_score:
-                    best_score = score
-                    best_match = i
+                # Combined similarity
+                similarity = (self.feature_weight * feature_sim + 
+                            self.position_weight * pos_sim)
+                
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = track_id
             
-            # Update track or mark as disappeared
-            if best_match is not None and best_score > 0.3:
-                matched_detections.add(best_match)
-                self.update_existing_track(
-                    track_id,
-                    current_boxes[best_match],
-                    current_features[best_match],
-                    frame_time,
-                    frame
-                )
-            else:
-                track['disappeared'] += 1
+            if best_match is not None and best_score > self.similarity_threshold:
+                self.update_existing_track(best_match, det_box, det_features, frame_time, frame)
+                matched_tracks.add(best_match)
+                matched_detections.add(det_idx)
         
         # Create new tracks for unmatched detections
-        for i, (box, features) in enumerate(zip(current_boxes, current_features)):
-            if i in matched_detections:
+        for det_idx in range(len(current_features)):
+            if det_idx in matched_detections:
                 continue
                 
-            # Check if this is likely a new person
-            if self.is_new_person(box, frame_time):
-                self.create_new_track(box, features, frame_time, frame)
+            self.create_new_track(
+                current_boxes[det_idx],
+                current_features[det_idx],
+                frame_time,
+                frame
+            )
         
-        # Clean up disappeared tracks
+        # Update unmatched tracks
         for track_id in list(self.active_tracks.keys()):
-            if self.active_tracks[track_id]['disappeared'] > self.track_memory:
-                del self.active_tracks[track_id]
+            if track_id not in matched_tracks:
+                track = self.active_tracks[track_id]
+                track['disappeared'] += 1
+                
+                if track['disappeared'] > self.max_disappeared:
+                    # Move to lost tracks
+                    self.lost_tracks[track_id] = {
+                        'features': track['features'],
+                        'box': track['box'],
+                        'last_seen': track['last_seen']
+                    }
+                    del self.active_tracks[track_id]
+    
+    def is_track_stable(self, track_id):
+        """Check if a track meets stability criteria"""
+        if track_id not in self.appearance_history:
+            return False
+            
+        history = self.appearance_history[track_id]
+        if len(history) < self.min_consecutive_detections:
+            return False
+            
+        # Check feature consistency
+        features = np.array([f for f in history[-self.min_consecutive_detections:]])
+        consistencies = []
+        for i in range(len(features)-1):
+            similarity = 1 - distance.cosine(features[i].flatten(), features[i+1].flatten())
+            consistencies.append(similarity)
+        
+        avg_consistency = np.mean(consistencies) if consistencies else 0
+        return avg_consistency >= self.track_quality_threshold
+    
+    def merge_similar_tracks(self):
+        """More conservative track merging"""
+        merged = set()
+        
+        for track_id1 in list(self.active_tracks.keys()):
+            if track_id1 in merged:
+                continue
+                
+            track1 = self.active_tracks[track_id1]
+            if not self.is_track_stable(track_id1):
+                continue
+                
+            for track_id2 in list(self.active_tracks.keys()):
+                if track_id2 in merged or track_id1 == track_id2:
+                    continue
+                    
+                track2 = self.active_tracks[track_id2]
+                if not self.is_track_stable(track_id2):
+                    continue
+                    
+                # Check temporal overlap
+                time_gap = abs(track1['last_seen'] - track2['last_seen'])
+                if time_gap > self.max_track_gap:
+                    continue
+                
+                # Calculate feature similarity
+                similarity = 1 - distance.cosine(
+                    track1['features'].flatten(),
+                    track2['features'].flatten()
+                )
+                
+                # Check position consistency
+                pos1 = self.calculate_box_center(track1['box'])
+                pos2 = self.calculate_box_center(track2['box'])
+                distance = np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+                
+                if (similarity > self.merge_threshold and 
+                    distance < self.max_position_jump):
+                    self.merge_tracks(track_id1, track_id2)
+                    merged.add(track_id2)
 
+    def process_video(self):
+        frame_count = 0
+        stable_tracks = set()
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+                
+            frame_time = frame_count / self.fps
+            frame_count += 1
+            
+            # Process frame
+            results = self.detector(frame, classes=[0])
+            detections = []
+            for result in results:
+                boxes = result.boxes.cpu().numpy()
+                for box in boxes:
+                    detections.append((box.xyxy[0], box.conf[0]))
+            
+            # Update tracks
+            self.update_tracks(frame, detections, frame_time)
+            
+            # Check track stability
+            for track_id in list(self.active_tracks.keys()):
+                if self.is_track_stable(track_id):
+                    stable_tracks.add(track_id)
+            
+            # Merge tracks periodically
+            if frame_count % (self.fps * 2) == 0:
+                self.merge_similar_tracks()
+        
+        # Final cleanup
+        final_tracks = {}
+        for track_id in stable_tracks:
+            if track_id in self.active_tracks:
+                track = self.active_tracks[track_id]
+                duration = track['last_seen'] - self.person_timestamps[track_id]['first_appearance']
+                if duration >= self.min_track_duration:
+                    final_tracks[track_id] = track
+        
+        self.active_tracks = final_tracks
+        return self.generate_report()
+    
     def save_person_image(self, person_id, frame):
         """Save person image in video-specific directory"""
         person_dir = os.path.join(self.images_dir, f"person_{person_id}")
