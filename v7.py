@@ -19,8 +19,7 @@ import pandas as pd
 # Set the working directory
 working_directory = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
                                  'Documents', 'VISIONARY', 'Durham Experiment', 'test_data')
-ouptut_dir = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
-                                 'Documents', 'VISIONARY', 'Durham Experiment', 'test_data', 'tracking_results')
+ouptut_dir = os.path.join(working_directory, 'tracking_results')
 
 class TrackingState:
     ACTIVE = 'active'          # Fully visible
