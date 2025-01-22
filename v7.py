@@ -17,7 +17,9 @@ import json
 import pandas as pd
 
 # Set the working directory
-working_directory = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
+# working_directory = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
+#                                  'Documents', 'VISIONARY', 'Durham Experiment', 'test_data')
+working_directory = os.path.join('D:\\', 'OneDrive - University of Exeter',
                                  'Documents', 'VISIONARY', 'Durham Experiment', 'test_data')
 ouptut_dir = os.path.join(working_directory, 'tracking_results')
 
@@ -201,9 +203,7 @@ class GlobalTracker:
             'valid_transitions': valid_transitions
         }
 
-# Modify the main function to use GlobalTracker
 def process_video_directory(input_dir, output_base_dir=None):
-    """Process videos with separate parameters for individual counting and transitions"""
     global_tracker = GlobalTracker()
     results = {}
     per_camera_stats = defaultdict(int)
@@ -217,22 +217,6 @@ def process_video_directory(input_dir, output_base_dir=None):
     
     os.makedirs(output_base_dir, exist_ok=True)
     
-    # Separate parameters for individual counting and cross-camera matching
-    individual_params = {
-        'similarity_threshold': 0.5,    # More lenient for same-camera tracking
-        'min_track_duration': 0.5,      # Shorter minimum duration (0.5 seconds)
-        'max_track_gap': 2.0,           # Allow longer gaps
-        'feature_consistency': 0.6,      # More lenient feature consistency
-        'min_detections': 2             # Require only 2 detections for counting
-    }
-    
-    transition_params = {
-        'similarity_threshold': 0.65,    # Stricter for cross-camera matching
-        'min_track_duration': 1.0,      # Longer duration required
-        'feature_consistency': 0.7,      # Stricter feature consistency
-        'min_detections': 3             # More detections required
-    }
-    
     # Process videos
     video_files = sorted(list(Path(input_dir).glob('*.[ma][pv][4i]')))
     print(f"\nFound {len(video_files)} videos")
@@ -245,11 +229,6 @@ def process_video_directory(input_dir, output_base_dir=None):
         try:
             # Initialize tracker
             tracker = PersonTracker(str(video_path), output_base_dir)
-            tracker.similarity_threshold = individual_params['similarity_threshold']
-            tracker.min_track_duration = individual_params['min_track_duration']
-            tracker.max_track_gap = individual_params['max_track_gap']
-            
-            # Process video
             tracker.process_video()
             
             # Identify stable tracks for individual counting
@@ -262,23 +241,14 @@ def process_video_directory(input_dir, output_base_dir=None):
                 features = np.array([f for f in tracker.appearance_history[track_id]])
                 
                 # Check for individual counting criteria
-                if (track_duration >= individual_params['min_track_duration'] and 
-                    len(features) >= individual_params['min_detections']):
+                if (track_duration >= 1.5 and  # Minimum 1.5 seconds
+                    len(features) >= 2):       # Minimum 2 detections
+                    individual_tracks[track_id] = track_info
                     
-                    if len(features) >= 2:
-                        consistency = np.mean([
-                            1 - distance.cosine(features[i].flatten(), features[i+1].flatten())
-                            for i in range(len(features)-1)
-                        ])
-                        
-                        if consistency >= individual_params['feature_consistency']:
-                            individual_tracks[track_id] = track_info
-                            
-                            # Check if track also meets transition criteria
-                            if (track_duration >= transition_params['min_track_duration'] and 
-                                len(features) >= transition_params['min_detections'] and 
-                                consistency >= transition_params['feature_consistency']):
-                                transition_tracks[track_id] = track_info
+                    # Check if track also meets transition criteria
+                    if (track_duration >= 3.0 and  # Minimum 3 seconds
+                        len(features) >= 3):       # Minimum 3 detections
+                        transition_tracks[track_id] = track_info
             
             # Update results with individual tracks
             video_results = {
@@ -317,7 +287,7 @@ def process_video_directory(input_dir, output_base_dir=None):
             print(traceback.format_exc())
             continue
     
-    # Rest of the code remains the same (CSV creation, etc.)
+    # Analyze camera transitions
     transition_analysis = global_tracker.analyze_camera_transitions()
     
     # Create CSV data
@@ -375,21 +345,6 @@ def find_csv_file(working_directory):
     print(f"1. Default path: {default_path}")
     print("2. All subdirectories of:", working_directory)
     return None
-
-def main():
-    # Process videos
-    summary = process_video_directory(working_directory)
-    
-    # Try to find the CSV file
-    csv_path = find_csv_file(working_directory)
-    
-    if csv_path and os.path.exists(csv_path):
-        print("\nCSV file contents:")
-        try:
-            df = pd.read_csv(csv_path)
-            print(df.to_string())
-        except Exception as e:
-            print(f"Error reading CSV: {str(e)}")
 
 class PersonTracker:
     def __init__(self, video_path, output_base_dir="tracking_results"):
