@@ -41,10 +41,10 @@ class GlobalTracker:
         # Stores color histograms for each identity
         self.color_features = {}
         
-        # Parameters for cross-camera matching - FURTHER MODIFIED
-        self.min_transition_time = 10       # Further reduced to catch more transitions
+        # Parameters for cross-camera matching - ADJUSTED AGAIN
+        self.min_transition_time = 15       # Increased back to 15 from 10
         self.max_transition_time = 900      # Maximum time (15 minutes)
-        self.cross_camera_threshold = 0.52  # Further reduced to be even more lenient
+        self.cross_camera_threshold = 0.57  # Increased from 0.52 to be more strict (reduce transitions)
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -189,8 +189,8 @@ class GlobalTracker:
             # Combined feature similarity - weighted average - MODIFIED
             feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
-            # Skip if feature similarity is below threshold - FURTHER MODIFIED
-            if feature_sim < 0.55:  # Further reduced to be more lenient
+            # Skip if feature similarity is below threshold - ADJUSTED AGAIN
+            if feature_sim < 0.60:  # Increased to be more strict (reduce transitions)
                 continue
             
             # For Camera 1 to Camera 2 transitions, check door interactions
@@ -312,17 +312,18 @@ class GlobalTracker:
                             if time_diff > 300 and not is_door_valid:
                                 continue
                         
-                        # FURTHER MODIFIED: Make door validation optional but still valuable
+                        # ADJUSTED AGAIN: Add transition validation to filter out one transition
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
-                        # Accept ALL possible transitions - FURTHER MODIFIED
-                        valid_transitions.append({
-                            'global_id': global_id,
-                            'exit_time': current['timestamp'],
-                            'entry_time': next_app['timestamp'],
-                            'transit_time': time_diff,
-                            'score': transition_score
-                        })
+                        # Accept transitions with some validation - ADJUSTED AGAIN
+                        if transition_score >= 1:  # Require at least one validation factor
+                            valid_transitions.append({
+                                'global_id': global_id,
+                                'exit_time': current['timestamp'],
+                                'entry_time': next_app['timestamp'],
+                                'transit_time': time_diff,
+                                'score': transition_score
+                            })
         
         # Sort transitions by quality
         if len(valid_transitions) > 0:
@@ -677,18 +678,18 @@ class PersonTracker:
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters - FURTHER MODIFIED
+        # Set camera-specific tracking parameters - ADJUSTED AGAIN
         if self.camera_id == 1:  # Café environment
             # Parameters optimized for complex environment
-            self.detection_threshold = 0.45  # Decreased to detect more people
-            self.matching_threshold = 0.52  # Reduced to make matching easier
+            self.detection_threshold = 0.38  # Further decreased to detect even more people
+            self.matching_threshold = 0.50  # Further reduced
             self.feature_weight = 0.75
             self.position_weight = 0.25
             self.max_disappeared = self.fps * 5
-            self.max_lost_age = self.fps * 25
-            self.merge_threshold = 0.58  # Increased to reduce merging (preserve more identities)
+            self.max_lost_age = self.fps * 30  # Increased to maintain tracks longer
+            self.merge_threshold = 0.62  # Further increased to preserve even more identities
         else:  # Food shop environment
-            # Parameters optimized for simpler environment
+            # Parameters optimized for simpler environment - keep the same
             self.detection_threshold = 0.52
             self.matching_threshold = 0.55
             self.feature_weight = 0.70
@@ -697,16 +698,16 @@ class PersonTracker:
             self.max_lost_age = self.fps * 20
             self.merge_threshold = 0.52
             
-        # Track quality thresholds - FURTHER MODIFIED
+        # Track quality thresholds - ADJUSTED AGAIN
         if self.camera_id == 1:
-            self.min_track_duration = 1.8  # Decreased to keep more tracks
-            self.min_detections = 5        # Decreased to keep more tracks
+            self.min_track_duration = 1.2  # Further decreased to keep even more tracks
+            self.min_detections = 3        # Further decreased to keep more tracks
         else:
             self.min_track_duration = 2.5  # Keep the same for Camera 2
             self.min_detections = 6        # Keep the same for Camera 2
         
-        # Track consolidation parameters - MODIFIED
-        self.consolidation_frequency = 10 if self.camera_id == 1 else 15  # More frequent consolidation
+        # Track consolidation parameters - ADJUSTED AGAIN
+        self.consolidation_frequency = 18 if self.camera_id == 1 else 15  # Less frequent consolidation for Camera 1
         
         # RTX 4090 Optimizations
         self.use_mixed_precision = True    # Use FP16 for faster inference
@@ -1116,17 +1117,17 @@ class PersonTracker:
         Returns:
             New track ID or None if creation failed
         """
-        # Camera-specific edge filtering - MODIFIED
+        # Camera-specific edge filtering - ADJUSTED AGAIN
         if self.camera_id == 1:
-            edge_margin = 20  # Increased from 16 to filter more edge detections
+            edge_margin = 15  # Further reduced from 20 to filter fewer edge detections
             if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
                 bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
                 # Only allow door region detections at edges
                 if not self.is_in_door_region(bbox):
                     return None
         else:
-            # Stricter edge filtering for Camera 2
-            edge_margin = 15  # Increased from 10
+            # Keep stricter edge filtering for Camera 2
+            edge_margin = 15
             if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
                 bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
                 # Make exception for door regions
@@ -1358,11 +1359,11 @@ class PersonTracker:
         if aspect_ratio < 1.4 or aspect_ratio > 3.0:  # More strict range (was 1.3-3.5)
             return False
             
-        # Filter out detections with too large or too small areas - FURTHER MODIFIED
+        # Filter out detections with too large or too small areas - ADJUSTED AGAIN
         area = width * height
         # Area thresholds based on typical human sizes
-        min_area = 1900 if self.camera_id == 1 else 2000  # Reduced for Camera 1
-        max_area = 0.22 * self.frame_width * self.frame_height if self.camera_id == 1 else 0.20 * self.frame_width * self.frame_height
+        min_area = 1600 if self.camera_id == 1 else 2000  # Further reduced for Camera 1
+        max_area = 0.25 * self.frame_width * self.frame_height if self.camera_id == 1 else 0.20 * self.frame_width * self.frame_height  # Increased max area for Camera 1
         
         if area < min_area or area > max_area:
             return False
