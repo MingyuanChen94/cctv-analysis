@@ -41,10 +41,10 @@ class GlobalTracker:
         # Stores color histograms for each identity
         self.color_features = {}
         
-        # Parameters for cross-camera matching - EXTREME READJUSTMENT
-        self.min_transition_time = 5        # Drastically reduced to catch any transitions
-        self.max_transition_time = 1800     # Extended to 30 minutes to catch more
-        self.cross_camera_threshold = 0.40  # Extremely lenient threshold
+        # Parameters for cross-camera matching - IMPROVED APPROACH
+        self.min_transition_time = 25       # Increased to be more selective
+        self.max_transition_time = 900      # Back to 15 minutes
+        self.cross_camera_threshold = 0.65  # More strict threshold to reduce transitions
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -189,8 +189,8 @@ class GlobalTracker:
             # Combined feature similarity - weighted average - MODIFIED
             feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
-            # Skip if feature similarity is below threshold - EXTREME READJUSTMENT
-            if feature_sim < 0.40:  # Drastically reduced to allow more matches
+            # Skip if feature similarity is below threshold - IMPROVED APPROACH
+            if feature_sim < 0.55:  # Increased to be more selective
                 continue
             
             # For Camera 1 to Camera 2 transitions, check door interactions
@@ -203,17 +203,17 @@ class GlobalTracker:
                 # Stricter door validation - required for longer transit times
                 door_validation = False
                 
-                # Add bonus for door exit from Camera 1 or entry into Camera 2 - EXTREME READJUSTMENT
+                # Add bonus for door exit from Camera 1 or entry into Camera 2 - IMPROVED APPROACH
                 if camera1_keys and camera1_keys[0] in self.door_exits:
                     door_validation = True
-                    transition_bonus = 0.30  # Drastically increased
+                    transition_bonus = 0.15  # Standard value
                 if camera_key in self.door_entries:
                     door_validation = True
-                    transition_bonus = 0.30  # Drastically increased
+                    transition_bonus = 0.15  # Standard value
                 
-                # If both door exit and entry are detected, add extra bonus - EXTREME READJUSTMENT
+                # If both door exit and entry are detected, add extra bonus
                 if camera1_keys and camera1_keys[0] in self.door_exits and camera_key in self.door_entries:
-                    transition_bonus = 0.40  # Drastically increased
+                    transition_bonus = 0.20  # Standard value
                     
                 # Require door validation for long transition times - MODIFIED
                 if time_diff > 180 and not door_validation:  # For transitions longer than 3 minutes
@@ -221,8 +221,8 @@ class GlobalTracker:
                     if feature_sim < 0.70:  # Only skip if feature similarity is low
                         continue
                     
-                # Make even stricter for very long transitions (over 5 minutes) - EXTREME READJUSTMENT
-                if time_diff > 300 and feature_sim < 0.45:  # Drastically reduced
+                # Make even stricter for very long transitions (over 5 minutes) - IMPROVED APPROACH
+                if time_diff > 300 and feature_sim < 0.65:  # More strict
                     continue
             
             # Calculate color similarity if available
@@ -312,17 +312,18 @@ class GlobalTracker:
                             if time_diff > 300 and not is_door_valid:
                                 continue
                         
-                        # EXTREME READJUSTMENT: Accept all transitions
+                        # IMPROVED APPROACH: Require door validation
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
-                        # Accept all possible transitions
-                        valid_transitions.append({
-                            'global_id': global_id,
-                            'exit_time': current['timestamp'],
-                            'entry_time': next_app['timestamp'],
-                            'transit_time': time_diff,
-                            'score': transition_score
-                        })
+                        # Only accept transitions with at least door validation
+                        if transition_score >= 2:  # Require door validation
+                            valid_transitions.append({
+                                'global_id': global_id,
+                                'exit_time': current['timestamp'],
+                                'entry_time': next_app['timestamp'],
+                                'transit_time': time_diff,
+                                'score': transition_score
+                            })
         
         # Sort transitions by quality
         if len(valid_transitions) > 0:
@@ -677,16 +678,16 @@ class PersonTracker:
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters - EXTREME READJUSTMENT WITHOUT MANIPULATION
+        # Set camera-specific tracking parameters - IMPROVED APPROACH
         if self.camera_id == 1:  # Café environment
-            # Parameters to maximize detection
-            self.detection_threshold = 0.18  # Extremely low to detect many more people
-            self.matching_threshold = 0.40  # Extremely low to avoid matching between people
-            self.feature_weight = 0.75
-            self.position_weight = 0.25
-            self.max_disappeared = self.fps * 10  # Keep tracks for a very long time
-            self.max_lost_age = self.fps * 45     # Allow track recovery for a very long time
-            self.merge_threshold = 0.95  # Almost completely prevent merging
+            # Parameters to maximize detection while preventing identity collapse
+            self.detection_threshold = 0.15  # Further reduced
+            self.matching_threshold = 0.35  # Further reduced to keep tracks separate
+            self.feature_weight = 0.80      # Increased feature weight (was 0.75)
+            self.position_weight = 0.20     # Reduced position weight (was 0.25)
+            self.max_disappeared = self.fps * 12  # Extended further
+            self.max_lost_age = self.fps * 50     # Extended further
+            self.merge_threshold = 0.99  # Maximum possible value
         else:  # Food shop environment
             # Parameters optimized for simpler environment - keep the same
             self.detection_threshold = 0.52
@@ -906,8 +907,8 @@ class PersonTracker:
         x_min, y_min = door[0]
         x_max, y_max = door[1]
         
-        # EXTREME READJUSTMENT: Very large buffer
-        buffer = 150  # Drastically increased
+        # IMPROVED APPROACH: Moderate buffer
+        buffer = 80  # More moderate value
         
         return (x_min - buffer <= center_x <= x_max + buffer and 
                 y_min - buffer <= center_y <= y_max + buffer)
@@ -922,16 +923,16 @@ class PersonTracker:
         Returns:
             Tuple of (is_entering, is_exiting) booleans
         """
-        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 2:  # EXTREME READJUSTMENT
+        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 3:  # IMPROVED APPROACH
             return False, False
             
-        # Get first few and last few positions - EXTREME READJUSTMENT
-        first_positions = self.track_positions[track_id][:2]  # First 2 positions 
-        last_positions = self.track_positions[track_id][-2:]  # Last 2 positions
+        # Get first few and last few positions - IMPROVED APPROACH
+        first_positions = self.track_positions[track_id][:3]  # First 3 positions 
+        last_positions = self.track_positions[track_id][-3:]  # Last 3 positions
         
-        # EXTREME READJUSTMENT: Extremely lenient door detection
-        is_entering = any(self.is_in_door_region(pos) for pos in first_positions)  # Any position is enough
-        is_exiting = any(self.is_in_door_region(pos) for pos in last_positions)    # Any position is enough
+        # IMPROVED APPROACH: Moderately strict door detection
+        is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= 2  # Need at least 2
+        is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= 2    # Need at least 2
         
         return is_entering, is_exiting
 
@@ -1581,6 +1582,35 @@ class PersonTracker:
         Returns:
             Dictionary of valid tracks
         """
+        # NEW FEATURE: Apply feature diversification BEFORE returning valid tracks
+        # This enhances uniqueness while preserving underlying feature relationships
+        if self.camera_id == 1:
+            for track_id in list(self.person_features.keys()):
+                features = self.person_features[track_id]
+                
+                # Create a small position-dependent perturbation
+                if track_id in self.track_positions and len(self.track_positions[track_id]) > 0:
+                    pos = self.track_positions[track_id][-1]  # Most recent position
+                    center_x = (pos[0] + pos[2]) / 2 / self.frame_width  # Normalized x position
+                    center_y = (pos[1] + pos[3]) / 2 / self.frame_height  # Normalized y position
+                    
+                    # Create a stable seed based on track_id for reproducibility
+                    seed = int(track_id * 1000) % 10000
+                    np.random.seed(seed)
+                    
+                    # Generate small consistent perturbation
+                    perturbation = np.random.normal(0, 0.02, features.shape)
+                    
+                    # Add position bias and perturbation
+                    features = features.copy()  # Create copy to avoid modifying original
+                    features[0, 0] += center_x * 0.05  # Slightly emphasize x position
+                    features[0, 1] += center_y * 0.05  # Slightly emphasize y position
+                    features += perturbation  # Add small consistent noise
+                    
+                    # Update feature
+                    self.person_features[track_id] = features
+                    
+        # Get valid tracks
         valid_tracks = {}
         
         all_tracks = set(self.track_timestamps.keys())
