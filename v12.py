@@ -1665,6 +1665,9 @@ def process_video_directory(input_dir, output_dir=None):
         input_dir_name = os.path.basename(os.path.normpath(input_dir))
         output_dir = os.path.join(input_dir, f"{input_dir_name}_results")
     
+    # Get folder name for file naming
+    folder_name = os.path.basename(os.path.normpath(input_dir))
+    
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1756,12 +1759,12 @@ def process_video_directory(input_dir, output_dir=None):
         }]
         
         # Save CSV for this day
-        day_csv_path = os.path.join(output_dir, f'tracking_summary_{date}.csv')
+        day_csv_path = os.path.join(output_dir, f'{folder_name}_tracking_summary_{date}.csv')
         df = pd.DataFrame(csv_data)
         df.to_csv(day_csv_path, index=False)
         
         # Save JSON with detailed results for this day
-        day_json_path = os.path.join(output_dir, f'tracking_results_{date}.json')
+        day_json_path = os.path.join(output_dir, f'{folder_name}_tracking_results_{date}.json')
         day_results = {
             'unique_camera1': transition_analysis['unique_camera1'],
             'unique_camera2': transition_analysis['unique_camera2'],
@@ -1790,12 +1793,12 @@ def process_video_directory(input_dir, output_dir=None):
         })
     
     # Save combined CSV
-    combined_csv_path = os.path.join(output_dir, 'tracking_summary_all_days.csv')
+    combined_csv_path = os.path.join(output_dir, f'{folder_name}_tracking_summary_all_days.csv')
     df = pd.DataFrame(all_csv_data)
     df.to_csv(combined_csv_path, index=False)
     
     # Save combined JSON with results from all days
-    combined_json_path = os.path.join(output_dir, 'tracking_results_all_days.json')
+    combined_json_path = os.path.join(output_dir, f'{folder_name}_tracking_results_all_days.json')
     with open(combined_json_path, 'w') as f:
         json.dump(all_days_results, f, indent=4)
     
