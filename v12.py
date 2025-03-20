@@ -316,14 +316,13 @@ class GlobalTracker:
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
                         # Accept ALL possible transitions - FURTHER MODIFIED
-                        # Remove scoring restriction completely
-                            valid_transitions.append({
-                                'global_id': global_id,
-                                'exit_time': current['timestamp'],
-                                'entry_time': next_app['timestamp'],
-                                'transit_time': time_diff,
-                                'score': transition_score
-                            })
+                        valid_transitions.append({
+                            'global_id': global_id,
+                            'exit_time': current['timestamp'],
+                            'entry_time': next_app['timestamp'],
+                            'transit_time': time_diff,
+                            'score': transition_score
+                        })
         
         # Sort transitions by quality
         if len(valid_transitions) > 0:
