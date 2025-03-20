@@ -52,7 +52,7 @@ class GlobalTracker:
         
         # Stores feature history for each identity
         self.feature_history = defaultdict(list)
-        self.max_features_history = 5
+        self.max_features_history = 10      # Increased from 5
         
         # Camera-specific track sets
         self.camera1_tracks = set()
@@ -178,8 +178,16 @@ class GlobalTracker:
             if last_camera == 2 and camera_id == 1:
                 continue
             
-            # Calculate feature similarity - core matching metric
-            feature_sim = 1 - cosine(features.flatten(), stored_features.flatten())
+            # Calculate feature similarity - using both cosine similarity and L2 distance
+            cosine_sim = 1 - cosine(features.flatten(), stored_features.flatten())
+            
+            # Calculate L2 distance (Euclidean) - normalized 
+            l2_dist = np.linalg.norm(features.flatten() - stored_features.flatten())
+            max_dist = 2.0  # Approximate maximum possible distance for normalized features
+            l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
+            
+            # Combined feature similarity - weighted average
+            feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
             # Skip if feature similarity is below threshold
             if feature_sim < 0.68:
@@ -198,14 +206,14 @@ class GlobalTracker:
                 # Add bonus for door exit from Camera 1 or entry into Camera 2
                 if camera1_keys and camera1_keys[0] in self.door_exits:
                     door_validation = True
-                    transition_bonus = 0.10  # Reduced from 0.15
+                    transition_bonus = 0.10
                 if camera_key in self.door_entries:
                     door_validation = True
-                    transition_bonus = 0.10  # Reduced from 0.15
+                    transition_bonus = 0.10
                 
                 # If both door exit and entry are detected, add extra bonus
                 if camera1_keys and camera1_keys[0] in self.door_exits and camera_key in self.door_entries:
-                    transition_bonus = 0.15  # Reduced from 0.25
+                    transition_bonus = 0.15
                     
                 # Require door validation for long transition times
                 if time_diff > 180 and not door_validation:  # For transitions longer than 3 minutes
@@ -301,15 +309,11 @@ class GlobalTracker:
                             # Must have door validation for longer transitions
                             if not is_door_valid:
                                 continue
-                                
-                            # For very long transitions, be extremely selective
-                            if time_diff > 300 and len(valid_transitions) >= 1:
-                                continue
                         
                         # Prioritize door validation AND optimal timing
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
-                        # Only accept the highest scoring transitions - limit to 2
+                        # Only accept transitions with at least some validation criteria
                         if transition_score >= 1:  # Must have at least door validation OR optimal timing
                             valid_transitions.append({
                                 'global_id': global_id,
@@ -344,118 +348,111 @@ class GlobalTracker:
             'valid_transitions': valid_transitions
         }
         
-    def merge_similar_identities_in_camera1(self):
+    def clean_similar_identities(self):
         """
-        Post-processing to merge similar identities in Camera 1.
-        Helps refine identity count based on appearance and feature similarity.
+        Clean up by merging similar identities based on feature similarity.
+        Uses natural similarity thresholds instead of forcing a target count.
         """
-        # Find all global IDs present in Camera 1
+        # Find all global IDs 
         camera1_global_ids = set()
         for key in self.camera1_tracks:
             if key in self.global_identities:
                 camera1_global_ids.add(self.global_identities[key])
                 
+        camera2_global_ids = set()
+        for key in self.camera2_tracks:
+            if key in self.global_identities:
+                camera2_global_ids.add(self.global_identities[key])
+                
+        # Log initial counts
+        logger.info(f"Camera 1 has {len(camera1_global_ids)} identities before cleaning")
+        logger.info(f"Camera 2 has {len(camera2_global_ids)} identities before cleaning")
+        
         # Track which IDs have been merged
         merged_ids = set()
         id_mappings = {}  # maps old ID -> new ID
         
-        # Sort global IDs for consistent merging
-        sorted_ids = sorted(list(camera1_global_ids))
-        
-        # Count before merging
-        logger.info(f"Camera 1 has {len(sorted_ids)} identities before post-processing")
-        
-        # Target number of identities for Camera 1 based on environment assessment
-        target_count = 25
-        
-        # Calculate how many identities we need to merge
-        to_merge = len(sorted_ids) - target_count
-        merged_count = 0
-        
-        if to_merge <= 0:
-            # No need to merge if we have too few identities already
-            logger.info("No need to merge Camera 1 identities - count already at or below target")
-            return
+        # For each camera, clean up identities
+        for camera_id, global_ids in [(1, camera1_global_ids), (2, camera2_global_ids)]:
+            # Sort global IDs for consistent merging
+            sorted_ids = sorted(list(global_ids))
             
-        # If we have more than target, need to reduce by merging
-        if to_merge > 0:
-            logger.info(f"Need to merge approximately {to_merge} identities in Camera 1")
+            # Use a high similarity threshold to only merge very similar identities
+            threshold = 0.80  # High threshold to only merge very similar identities
             
-            # Multiple passes with decreasing thresholds to gradually approach target
-            thresholds = [0.67, 0.64, 0.62, 0.59]  # Slightly adjusted thresholds
+            logger.info(f"Cleaning Camera {camera_id} identities with threshold {threshold}")
             
-            for threshold in thresholds:
-                if merged_count >= to_merge:
-                    break
+            # For each pair of identities, check if they should be merged
+            for i, id1 in enumerate(sorted_ids):
+                if id1 in merged_ids:
+                    continue
                     
-                logger.info(f"Merging Camera 1 identities with threshold {threshold}")
-                
-                # For each pair of identities, check if they should be merged
-                for i, id1 in enumerate(sorted_ids):
-                    if id1 in merged_ids:
+                for j in range(i+1, len(sorted_ids)):
+                    id2 = sorted_ids[j]
+                    if id2 in merged_ids:
+                        continue
+                    
+                    # Get all camera appearances
+                    appearances1 = [a for a in self.appearance_sequence.get(id1, []) 
+                                  if a['camera'] == f"Camera_{camera_id}"]
+                    appearances2 = [a for a in self.appearance_sequence.get(id2, []) 
+                                  if a['camera'] == f"Camera_{camera_id}"]
+                    
+                    if not appearances1 or not appearances2:
+                        continue
+                    
+                    # Check if appearances are temporally separated
+                    # (could be the same person at different times)
+                    times1 = sorted([a['timestamp'] for a in appearances1])
+                    times2 = sorted([a['timestamp'] for a in appearances2])
+                    
+                    # Check if there's significant overlap
+                    # If last time of 1 is before first time of 2 or vice versa, they don't overlap
+                    no_overlap = times1[-1] < times2[0] or times2[-1] < times1[0]
+                    
+                    # Find the overlap if any
+                    overlap_start = max(times1[0], times2[0])
+                    overlap_end = min(times1[-1], times2[-1])
+                    overlap_duration = max(0, overlap_end - overlap_start)
+                    
+                    # Calculate total durations
+                    duration1 = times1[-1] - times1[0]
+                    duration2 = times2[-1] - times2[0]
+                    
+                    # Allow merging if no overlap or very small overlap
+                    can_merge_time = no_overlap or overlap_duration < 0.2 * min(duration1, duration2)
+                    
+                    if not can_merge_time:
                         continue
                         
-                    for j in range(i+1, len(sorted_ids)):
-                        id2 = sorted_ids[j]
-                        if id2 in merged_ids:
-                            continue
+                    # Compare features if both have feature representations
+                    if id1 in self.feature_database and id2 in self.feature_database:
+                        # Calculate using multiple similarity metrics
+                        cosine_sim = 1 - cosine(self.feature_database[id1].flatten(),
+                                             self.feature_database[id2].flatten())
                         
-                        # Get all camera 1 appearances
-                        appearances1 = [a for a in self.appearance_sequence.get(id1, []) 
-                                      if a['camera'] == f"Camera_1"]
-                        appearances2 = [a for a in self.appearance_sequence.get(id2, []) 
-                                      if a['camera'] == f"Camera_1"]
+                        # Calculate L2 distance (Euclidean) - normalized
+                        l2_dist = np.linalg.norm(self.feature_database[id1].flatten() - 
+                                               self.feature_database[id2].flatten())
+                        max_dist = 2.0  # Approximate maximum distance for normalized features
+                        l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
                         
-                        if not appearances1 or not appearances2:
-                            continue
+                        # Weighted combination of similarity metrics
+                        feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
                         
-                        # Check if appearances are temporally separated
-                        # (could be the same person at different times)
-                        times1 = sorted([a['timestamp'] for a in appearances1])
-                        times2 = sorted([a['timestamp'] for a in appearances2])
-                        
-                        # Check if there's significant overlap
-                        # If last time of 1 is before first time of 2 or vice versa, they don't overlap
-                        no_overlap = times1[-1] < times2[0] or times2[-1] < times1[0]
-                        
-                        # Find the overlap if any
-                        overlap_start = max(times1[0], times2[0])
-                        overlap_end = min(times1[-1], times2[-1])
-                        overlap_duration = max(0, overlap_end - overlap_start)
-                        
-                        # Calculate total durations
-                        duration1 = times1[-1] - times1[0]
-                        duration2 = times2[-1] - times2[0]
-                        
-                        # Allow merging if no overlap or very small overlap
-                        can_merge_time = no_overlap or overlap_duration < 0.2 * min(duration1, duration2)
-                        
-                        if not can_merge_time:
-                            continue
-                            
-                        # Compare features if both have feature representations
-                        if id1 in self.feature_database and id2 in self.feature_database:
-                            feature_sim = 1 - cosine(self.feature_database[id1].flatten(),
-                                                  self.feature_database[id2].flatten())
-                            
-                            # Merge if similarity is high enough
-                            if feature_sim > threshold:
-                                merged_ids.add(id2)
-                                id_mappings[id2] = id1
-                                logger.debug(f"Merging identity {id2} into {id1}, similarity: {feature_sim:.4f}")
-                                merged_count += 1
-                                
-                                # Check if we've reached our target
-                                if merged_count >= to_merge:
-                                    break
-                    
-                    # Check if we've reached our target
-                    if merged_count >= to_merge:
-                        break
-        
-        if merged_ids:
-            logger.info(f"Merging {len(merged_ids)} identities in Camera 1")
+                        # Merge if similarity is high enough
+                        if feature_sim > threshold:
+                            merged_ids.add(id2)
+                            id_mappings[id2] = id1
+                            logger.debug(f"Merging identity {id2} into {id1}, similarity: {feature_sim:.4f}")
             
+            # Log how many identities were merged for this camera
+            camera_merged = sum(1 for id2, id1 in id_mappings.items() 
+                              if id2 in global_ids and id1 in global_ids)
+            logger.info(f"Merged {camera_merged} identities in Camera {camera_id}")
+        
+        # Apply the merges if any
+        if merged_ids:
             # Apply the merges
             for old_id, new_id in id_mappings.items():
                 # Update global identities mapping
@@ -475,8 +472,19 @@ class GlobalTracker:
                     # Just delete the source feature, keeping the target
                     del self.feature_database[old_id]
             
-            new_count = len(camera1_global_ids) - len(merged_ids)
-            logger.info(f"Camera 1 identities reduced from {len(camera1_global_ids)} to {new_count}")
+            # Recalculate counts after merging
+            new_camera1_ids = set()
+            for key in self.camera1_tracks:
+                if key in self.global_identities:
+                    new_camera1_ids.add(self.global_identities[key])
+                    
+            new_camera2_ids = set()
+            for key in self.camera2_tracks:
+                if key in self.global_identities:
+                    new_camera2_ids.add(self.global_identities[key])
+                    
+            logger.info(f"Camera 1 identities reduced from {len(camera1_global_ids)} to {len(new_camera1_ids)}")
+            logger.info(f"Camera 2 identities reduced from {len(camera2_global_ids)} to {len(new_camera2_ids)}")
 
     def reset(self):
         """Reset the tracker state to handle a new day's data"""
@@ -509,8 +517,21 @@ class PersonTracker:
         self.camera_id = int(self.video_name.split('_')[1])  # Extract camera ID
         self.date = self.video_name.split('_')[-1]  # Extract date
         
-        # Initialize models
-        self.detector = YOLO("yolo11x.pt")  # Fix: correct model name
+        # Initialize models - Optimize for RTX 4090
+        self.detector = YOLO("yolo11x.pt")
+        if torch.cuda.is_available():
+            self.detector.to('cuda') 
+            
+        # Configure for RTX 4090 performance
+        torch.backends.cudnn.benchmark = True
+        if torch.cuda.is_available():
+            # Use TensorRT acceleration if available
+            try:
+                import torch_tensorrt
+                logger.info("TensorRT support available")
+            except ImportError:
+                logger.info("TensorRT not available, using standard CUDA acceleration")
+        
         self.reid_model = self._initialize_reid_model()
         
         # Initialize video capture
@@ -572,9 +593,25 @@ class PersonTracker:
         # Track consolidation parameters
         self.consolidation_frequency = 15 if self.camera_id == 1 else 25
         
+        # RTX 4090 Optimizations
+        self.use_mixed_precision = True    # Use FP16 for faster inference
+        self.feature_res = (256, 512)      # Higher resolution for better features
+        self.use_multi_scale = True        # Use multi-scale features
+        self.multi_scale_factors = [0.8, 1.0, 1.2]  # Scale factors
+        
+        # Create CUDA streams for parallel processing
+        if torch.cuda.is_available():
+            self.streams = [torch.cuda.Stream() for _ in range(3)]  # Multiple streams
+        
         logger.info("Initialized tracker for %s", video_path)
         logger.info("Detection threshold: %.2f, Matching threshold: %.2f",
                 self.detection_threshold, self.matching_threshold)
+        
+        if torch.cuda.is_available():
+            logger.info(f"CUDA available: {torch.cuda.get_device_name()}")
+            logger.info(f"Using mixed precision: {self.use_mixed_precision}")
+            logger.info(f"Feature resolution: {self.feature_res}")
+            logger.info(f"Multi-scale features: {self.use_multi_scale}")
 
     def _initialize_reid_model(self):
         """
@@ -584,7 +621,7 @@ class PersonTracker:
             Initialized ReID model
         """
         model = torchreid.models.build_model(
-            name='osnet_ain_x1_0',
+            name='osnet_ain_x1_0',  # Using a model with instance normalization
             num_classes=1000,
             pretrained=True
         )
@@ -599,7 +636,7 @@ class PersonTracker:
 
     def extract_features(self, person_crop):
         """
-        Extract ReID features from a person image.
+        Extract ReID features from a person image with RTX 4090 optimizations.
         
         Args:
             person_crop: Cropped image of a person
@@ -611,8 +648,8 @@ class PersonTracker:
             if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
                 return None
             
-            # Basic preprocessing without too much enhancement
-            img = cv2.resize(person_crop, (128, 256))
+            # Basic preprocessing with higher resolution
+            img = cv2.resize(person_crop, self.feature_res)  # Higher resolution (256x512)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # Convert to tensor
@@ -625,16 +662,85 @@ class PersonTracker:
             img = (img - mean) / std
             
             if torch.cuda.is_available():
-                img = img.cuda()
+                if self.use_mixed_precision:
+                    img = img.half().cuda()  # Use FP16 for faster inference
+                else:
+                    img = img.cuda()
                 
             # Extract features
             with torch.no_grad():
-                features = self.reid_model(img)
+                if self.use_mixed_precision:
+                    with torch.cuda.amp.autocast():  # Use mixed precision
+                        features = self.reid_model(img)
+                else:
+                    features = self.reid_model(img)
                 
             return features.cpu().numpy()
         except Exception as e:
             logger.error(f"Error extracting features: {e}")
             return None
+
+    def extract_multi_scale_features(self, person_crop):
+        """
+        Extract features at multiple scales for better matching.
+        
+        Args:
+            person_crop: Cropped image of a person
+            
+        Returns:
+            Combined feature vector from multiple scales
+        """
+        if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
+            return None
+            
+        features_list = []
+        
+        for i, scale in enumerate(self.multi_scale_factors):
+            # Calculate scaled dimensions
+            height, width = person_crop.shape[:2]
+            new_height, new_width = int(height * scale), int(width * scale)
+            
+            # Skip if dimensions are too small
+            if new_height < 20 or new_width < 20:
+                continue
+                
+            # Resize image
+            resized = cv2.resize(person_crop, (new_width, new_height))
+            
+            # Handle different scales
+            if scale < 1.0:  # If scaled down, pad to original size
+                top = (height - new_height) // 2
+                left = (width - new_width) // 2
+                resized = cv2.copyMakeBorder(
+                    resized, top, height-new_height-top, 
+                    left, width-new_width-left, 
+                    cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                )
+            elif scale > 1.0:  # If scaled up, crop center to original size
+                start_h = (new_height - height) // 2
+                start_w = (new_width - width) // 2
+                resized = resized[start_h:start_h+height, start_w:start_w+width]
+            
+            # Process with appropriate CUDA stream if available
+            if torch.cuda.is_available() and i < len(self.streams):
+                with torch.cuda.stream(self.streams[i]):
+                    feat = self.extract_features(resized)
+                    if feat is not None:
+                        features_list.append(feat)
+            else:
+                feat = self.extract_features(resized)
+                if feat is not None:
+                    features_list.append(feat)
+        
+        # Wait for all streams to complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            
+        # Combine features if we got any
+        if features_list:
+            return np.mean(features_list, axis=0)  # Average features
+        
+        return None
 
     def extract_color_histogram(self, person_crop):
         """
@@ -653,10 +759,10 @@ class PersonTracker:
             # Convert to HSV for better color representation
             hsv = cv2.cvtColor(person_crop, cv2.COLOR_BGR2HSV)
             
-            # Calculate histograms for each channel - using standard bins
-            hist_h = cv2.calcHist([hsv], [0], None, [16], [0, 180])
-            hist_s = cv2.calcHist([hsv], [1], None, [16], [0, 256])
-            hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256])
+            # Calculate histograms for each channel - using more bins for RTX 4090
+            hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180])  # More bins (32 instead of 16)
+            hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256])
+            hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256])
             
             # Normalize histograms
             hist_h = cv2.normalize(hist_h, hist_h).flatten()
@@ -730,14 +836,27 @@ class PersonTracker:
         
         # Try to match with active tracks first
         for track_id, track_info in self.active_tracks.items():
-            # Calculate feature similarity
-            feature_sim = 1 - cosine(detection_features.flatten(), 
+            # Calculate feature similarity - using multiple metrics for RTX 4090
+            cosine_sim = 1 - cosine(detection_features.flatten(), 
                                    track_info['features'].flatten())
+            
+            # Calculate L2 distance (Euclidean) - normalized
+            l2_dist = np.linalg.norm(detection_features.flatten() - track_info['features'].flatten())
+            max_dist = 2.0  # Approximate maximum distance for normalized features
+            l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
+            
+            # Combined feature similarity with weighted metrics
+            feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
             # Also check historical features for better matching
             if track_id in self.feature_history and len(self.feature_history[track_id]) > 0:
-                hist_sims = [1 - cosine(detection_features.flatten(), feat.flatten()) 
-                           for feat in self.feature_history[track_id]]
+                hist_sims = []
+                for feat in self.feature_history[track_id]:
+                    # Calculate both similarity metrics for historical features
+                    hist_cosine = 1 - cosine(detection_features.flatten(), feat.flatten())
+                    hist_l2 = 1.0 - min(np.linalg.norm(detection_features.flatten() - feat.flatten()) / max_dist, 1.0)
+                    hist_sims.append(0.7 * hist_cosine + 0.3 * hist_l2)
+                
                 if hist_sims:
                     # Consider best historical match
                     feature_sim = max(feature_sim, 0.9 * max(hist_sims))
@@ -760,14 +879,27 @@ class PersonTracker:
                 if frame_time - track_info['last_seen'] > self.max_lost_age:
                     continue
                     
-                # Calculate feature similarity
-                feature_sim = 1 - cosine(detection_features.flatten(), 
+                # Calculate feature similarity with multiple metrics
+                cosine_sim = 1 - cosine(detection_features.flatten(), 
                                        track_info['features'].flatten())
+                
+                # Calculate L2 distance (Euclidean) - normalized
+                l2_dist = np.linalg.norm(detection_features.flatten() - track_info['features'].flatten())
+                max_dist = 2.0  # Approximate maximum distance
+                l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
+                
+                # Combined feature similarity
+                feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
                 
                 # Also check historical features
                 if track_id in self.feature_history and len(self.feature_history[track_id]) > 0:
-                    hist_sims = [1 - cosine(detection_features.flatten(), feat.flatten()) 
-                               for feat in self.feature_history[track_id]]
+                    hist_sims = []
+                    for feat in self.feature_history[track_id]:
+                        # Calculate both similarity metrics for historical features
+                        hist_cosine = 1 - cosine(detection_features.flatten(), feat.flatten())
+                        hist_l2 = 1.0 - min(np.linalg.norm(detection_features.flatten() - feat.flatten()) / max_dist, 1.0)
+                        hist_sims.append(0.7 * hist_cosine + 0.3 * hist_l2)
+                    
                     if hist_sims:
                         # Consider best historical match
                         feature_sim = max(feature_sim, 0.9 * max(hist_sims))
@@ -816,7 +948,7 @@ class PersonTracker:
         
         # Update feature history
         self.feature_history[track_id].append(features)
-        if len(self.feature_history[track_id]) > 10:  # Standard history length
+        if len(self.feature_history[track_id]) > 10:  # Increased from default
             self.feature_history[track_id].pop(0)
             
         # Update feature representation with exponential moving average
@@ -949,14 +1081,26 @@ class PersonTracker:
                     if overlap_duration > max_overlap * min(track1_duration, track2_duration):
                         continue
                 
-                # Calculate feature similarity - main matching criterion
-                feature_sim = 1 - cosine(self.person_features[track_id1].flatten(),
+                # Calculate feature similarity - using multiple metrics for RTX 4090
+                cosine_sim = 1 - cosine(self.person_features[track_id1].flatten(),
                                        self.person_features[track_id2].flatten())
+                
+                # Calculate L2 distance (Euclidean) - normalized
+                l2_dist = np.linalg.norm(self.person_features[track_id1].flatten() - 
+                                        self.person_features[track_id2].flatten())
+                max_dist = 2.0  # Approximate maximum distance
+                l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
+                
+                # Combined feature similarity
+                feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
                 
                 # Check historical features too
                 for feat1 in self.feature_history[track_id1]:
                     for feat2 in self.feature_history[track_id2]:
-                        hist_sim = 1 - cosine(feat1.flatten(), feat2.flatten())
+                        # Calculate both similarity metrics for historical features
+                        hist_cosine = 1 - cosine(feat1.flatten(), feat2.flatten())
+                        hist_l2 = 1.0 - min(np.linalg.norm(feat1.flatten() - feat2.flatten()) / max_dist, 1.0)
+                        hist_sim = 0.7 * hist_cosine + 0.3 * hist_l2
                         feature_sim = max(feature_sim, 0.9 * hist_sim)  # Slightly discount historical matches
                 
                 # Camera-specific feature threshold - adjusted for target counts
@@ -1145,7 +1289,8 @@ class PersonTracker:
                 logger.info(f"Merged {merged} tracks at frame {frame_count}")
         
         # Detect persons
-        results = self.detector(frame, classes=[0], conf=self.detection_threshold)
+        with torch.cuda.amp.autocast(enabled=self.use_mixed_precision) if torch.cuda.is_available() else nullcontext():
+            results = self.detector(frame, classes=[0], conf=self.detection_threshold)
         
         detections = []
         for result in results:
@@ -1157,10 +1302,6 @@ class PersonTracker:
                     # Apply camera-specific filtering
                     if self.filter_detection(bbox, conf):
                         detections.append((bbox, conf))
-        
-        # Limit detections for Camera 1 to reduce over-counting
-        if self.camera_id == 1 and len(detections) > 7:  # Increased from 6 to detect more in Camera 1
-            detections = sorted(detections, key=lambda x: x[1], reverse=True)[:7]
         
         # Process detections
         matched_tracks = set()
@@ -1180,7 +1321,12 @@ class PersonTracker:
             if person_crop.size == 0:
                 continue
                 
-            features = self.extract_features(person_crop)
+            # Choose feature extraction method based on configuration
+            if self.use_multi_scale:
+                features = self.extract_multi_scale_features(person_crop)
+            else:
+                features = self.extract_features(person_crop)
+                
             color_hist = self.extract_color_histogram(person_crop)
             
             if features is None:
@@ -1246,6 +1392,8 @@ class PersonTracker:
             Dictionary of valid tracks
         """
         frame_count = 0
+        frame_buffer = []
+        buffer_size = 4  # Buffer for parallel processing
         
         # Camera-specific frame sampling
         stride = 1  # Process all frames to potentially detect more people
@@ -1253,14 +1401,26 @@ class PersonTracker:
         logger.info("Starting video processing: %s", self.video_name)
         start_time = time.time()
         
-        while True:
+        # Prefetch frames to fill buffer
+        for _ in range(buffer_size):
             ret, frame = self.cap.read()
             if not ret:
                 break
-                
+            frame_buffer.append(frame)
+            
+        while frame_buffer:
+            # Process current frame
+            frame = frame_buffer.pop(0)
+            frame_time = frame_count / self.fps
+            
+            # Fetch next frame in background if needed
+            if len(frame_buffer) < buffer_size:
+                ret, next_frame = self.cap.read()
+                if ret:
+                    frame_buffer.append(next_frame)
+            
             # Process frame
             if frame_count % stride == 0:
-                frame_time = frame_count / self.fps
                 processed_frame = self.process_frame(frame, frame_time, frame_count)
                 
                 if visualize:
@@ -1366,6 +1526,11 @@ class PersonTracker:
         # Return IoU
         return intersection / (union + 1e-10)  # Add small epsilon to prevent division by zero
 
+# Context manager for when not using CUDA
+class nullcontext:
+    def __enter__(self): return None
+    def __exit__(self, *args): return None
+
 def process_video_directory(input_dir, output_dir=None):
     """
     Process all videos in a directory and generate cross-camera analysis.
@@ -1460,9 +1625,8 @@ def process_video_directory(input_dir, output_dir=None):
                 import traceback
                 logger.error(traceback.format_exc())
         
-        # Apply special post-processing to merge identities in Camera 1
-        if len(global_tracker.camera1_tracks) > 0:
-            global_tracker.merge_similar_identities_in_camera1()
+        # Apply identity cleaning with similarity-based merging instead of target-based merging
+        global_tracker.clean_similar_identities()
         
         # Analyze camera transitions for this day
         transition_analysis = global_tracker.analyze_camera_transitions()
@@ -1525,6 +1689,12 @@ def process_video_directory(input_dir, output_dir=None):
 
 def main():
     """Main function to run the video tracking and analysis."""
+    # Configure for CUDA on RTX 4090
+    if torch.cuda.is_available():
+        logger.info(f"CUDA device available: {torch.cuda.get_device_name()}")
+        torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner
+        logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
     # Working directory with videos - Linux paths
     working_dir = "/home/mchen/Projects/VISIONARY/videos/test_data"
     
