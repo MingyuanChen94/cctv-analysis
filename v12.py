@@ -29,6 +29,7 @@ class TrackingState:
 class GlobalTracker:
     """
     Manages cross-camera identity matching and transition detection.
+    Enhanced to handle the complex café to food shop transition scenarios.
     """
     def __init__(self):
         """Initialize the global tracker with identity mapping structures."""
@@ -41,10 +42,14 @@ class GlobalTracker:
         # Stores color histograms for each identity
         self.color_features = {}
         
-        # Parameters for cross-camera matching
-        self.min_transition_time = 10       # Minimum time between cameras
-        self.max_transition_time = 1200     # Maximum time (20 minutes)
-        self.cross_camera_threshold = 0.50  # Base threshold for cross-camera matching
+        # Parameters for cross-camera matching - adjusted for café to food shop scenario
+        self.min_transition_time = 5        # Shorter minimum time for quick transitions
+        self.max_transition_time = 1800     # Extended to 30 minutes for people who might sit in café first
+        self.cross_camera_threshold = 0.45  # Lower threshold to catch more transitions
+        
+        # Additional transition parameters for partial visibility scenarios
+        self.cafe_exit_likelihood = {}      # Track likelihood of café exits
+        self.shop_entry_likelihood = {}     # Track likelihood of shop entries
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -52,14 +57,34 @@ class GlobalTracker:
         
         # Stores feature history for each identity
         self.feature_history = defaultdict(list)
-        self.max_features_history = 10
+        self.max_features_history = 15      # Keep more historical features
         
         # Camera-specific track sets
         self.camera1_tracks = set()
         self.camera2_tracks = set()
         
+        # Enhanced tracking of lighting conditions by camera
+        self.camera_lighting_profiles = {
+            1: [],  # Lighting profile samples for Camera 1
+            2: []   # Lighting profile samples for Camera 2
+        }
+        
+        # Special handling for café environment's partial visibility
+        self.enable_partial_visibility_matching = True
+        self.temporal_transition_model = {
+            # Probability distribution of transition times (in seconds)
+            'time_distribution': {
+                '0-30': 0.2,     # Quick transitions (20%)
+                '30-60': 0.35,   # Normal transitions (35%)
+                '60-180': 0.25,  # Longer transitions (25%)
+                '180-600': 0.15, # Extended transitions (15%)
+                '600+': 0.05     # Very long transitions (5%)
+            }
+        }
+        
         logger.info("GlobalTracker initialized with threshold: %.2f", self.cross_camera_threshold)
         logger.info("Transit time window: %d-%d seconds", self.min_transition_time, self.max_transition_time)
+        logger.info("Enhanced café to food shop transition modeling enabled")
 
     def register_detection(self, camera_id, track_id, features, timestamp, 
                            color_hist=None, is_entry=False, is_exit=False):
@@ -128,6 +153,7 @@ class GlobalTracker:
     def _match_or_create_global_id(self, camera_id, track_id, features, timestamp):
         """
         Match with existing global identity or create a new one.
+        Enhanced for café (Camera 1) to food shop (Camera 2) transitions with partial visibility.
         
         Args:
             camera_id: ID of the camera (1 or 2)
@@ -147,7 +173,8 @@ class GlobalTracker:
             # Update feature database with new sample
             if global_id in self.feature_database:
                 # Use weighted average with moderate weight
-                alpha = 0.7  # Increased to preserve identity consistency
+                # Higher alpha for Camera 1 to preserve identity with partial visibility
+                alpha = 0.75 if camera_id == 1 else 0.65
                 self.feature_database[global_id] = (
                     alpha * self.feature_database[global_id] + 
                     (1 - alpha) * features
@@ -157,6 +184,8 @@ class GlobalTracker:
         
         best_match_id = None
         best_match_score = 0
+        second_best_match_id = None  # Track second best match for ambiguity resolution
+        second_best_match_score = 0
         
         # Try to match with existing global identities
         for global_id, stored_features in self.feature_database.items():
@@ -169,9 +198,10 @@ class GlobalTracker:
             
             # Skip if same camera or outside transition time window
             time_diff = timestamp - last_appearance['timestamp']
-            if last_camera == camera_id or \
-               time_diff < self.min_transition_time or \
-               time_diff > self.max_transition_time:
+            if last_camera == camera_id:
+                continue
+                
+            if time_diff < self.min_transition_time or time_diff > self.max_transition_time:
                 continue
             
             # Only allow Camera 1 to Camera 2 transitions (not 2 to 1)
@@ -189,38 +219,63 @@ class GlobalTracker:
             # Combined feature similarity - weighted average
             feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
+            # Check historical features too for better matching
+            if global_id in self.feature_history and len(self.feature_history[global_id]) > 0:
+                hist_sims = []
+                for hist_feat in self.feature_history[global_id]:
+                    hist_cosine = 1 - cosine(features.flatten(), hist_feat.flatten())
+                    hist_l2 = 1.0 - min(np.linalg.norm(features.flatten() - hist_feat.flatten()) / max_dist, 1.0)
+                    hist_sims.append(0.7 * hist_cosine + 0.3 * hist_l2)
+                
+                if hist_sims:
+                    # Use best historical match
+                    hist_sim = max(hist_sims)
+                    # Blend with current similarity, giving more weight to best match
+                    feature_sim = max(feature_sim, 0.8 * hist_sim)
+            
             # Adaptive threshold based on camera
-            cross_camera_min_threshold = 0.48 if camera_id == 1 else 0.52
+            cross_camera_min_threshold = 0.40  # Lower base threshold
             
             # Skip if feature similarity is below threshold
             if feature_sim < cross_camera_min_threshold:
                 continue
             
-            # For Camera 1 to Camera 2 transitions, check door interactions
+            # For Camera 1 to Camera 2 transitions, additional validation
             transition_bonus = 0
             if last_camera == 1 and camera_id == 2:
                 # Find the camera1 track key that matches this global ID
                 camera1_keys = [k for k, v in self.global_identities.items() 
                               if v == global_id and k.startswith('1_')]
                 
-                # Add bonus for door exit from Camera 1 or entry into Camera 2
+                # Door validation provides strong evidence - add significant bonus
                 if camera1_keys and camera1_keys[0] in self.door_exits:
-                    transition_bonus = 0.15
+                    transition_bonus += 0.20
                 if camera_key in self.door_entries:
-                    transition_bonus = 0.15
+                    transition_bonus += 0.20
                 
-                # If both door exit and entry are detected, add extra bonus
-                if camera1_keys and camera1_keys[0] in self.door_exits and camera_key in self.door_entries:
-                    transition_bonus = 0.20
+                # Time-based validation
+                time_category = self._get_time_category(time_diff)
+                if time_category in self.temporal_transition_model['time_distribution']:
+                    # Add bonus based on probability of this transition time
+                    time_prob = self.temporal_transition_model['time_distribution'][time_category]
+                    transition_bonus += 0.15 * time_prob
+                
+                # Special handling for partial visibility scenarios (café to shop)
+                if self.enable_partial_visibility_matching:
+                    # Check if person likely exited café (was near door/tables)
+                    exit_likelihood = self.cafe_exit_likelihood.get(camera1_keys[0] if camera1_keys else None, 0)
+                    transition_bonus += 0.10 * exit_likelihood
                     
-                # More flexible validation for long transitions
-                door_validation = (camera1_keys and camera1_keys[0] in self.door_exits) or camera_key in self.door_entries
-                
-                # Stricter requirements for very long transitions
-                if time_diff > 300 and not door_validation and feature_sim < 0.65:
-                    continue
+                    # Check if person likely entered shop (was near door)
+                    entry_likelihood = self.shop_entry_likelihood.get(camera_key, 0)
+                    transition_bonus += 0.10 * entry_likelihood
+                    
+                    # For long transitions, require some door validation or high feature similarity
+                    if time_diff > 300:
+                        if transition_bonus < 0.15 and feature_sim < 0.60:
+                            continue
             
-            # Calculate color similarity if available
+            # Calculate color similarity with compensation for lighting differences
             color_sim = 0
             if camera_key in self.color_features and len(self.color_features[camera_key]) > 0:
                 camera1_keys = [k for k, v in self.global_identities.items() 
@@ -228,27 +283,68 @@ class GlobalTracker:
                 if camera1_keys and camera1_keys[0] in self.color_features and len(self.color_features[camera1_keys[0]]) > 0:
                     color_feats1 = self.color_features[camera1_keys[0]][-1]
                     color_feats2 = self.color_features[camera_key][-1]
+                    
+                    # Standard color similarity
                     color_sim = 1 - cosine(color_feats1.flatten(), color_feats2.flatten())
+                    
+                    # Enhanced color matching for lighting differences between café and shop
+                    if last_camera == 1 and camera_id == 2:
+                        # Calculate similarities on subsets of the color histogram
+                        # (e.g., focus on hue and saturation components which are less affected by lighting)
+                        if len(color_feats1) > 64 and len(color_feats2) > 64:
+                            # Get hue components (first 32 elements in standard HSV histogram)
+                            hue_sim = 1 - cosine(color_feats1[:32].flatten(), color_feats2[:32].flatten())
+                            # Weight hue similarity more for lighting-robust matching
+                            color_sim = 0.7 * hue_sim + 0.3 * color_sim
             
-            # Calculate time-based factor - prefer transitions around 1 minute
-            if time_diff <= 180:  # For transitions up to 3 minutes
-                optimal_transit = 60
-                max_deviation = 120
-                time_factor = max(0, 1.0 - abs(time_diff - optimal_transit) / max_deviation)
-            else:  # For longer transitions (3-20 minutes)
-                # Exponential decay factor for longer times
-                time_factor = max(0, 0.5 * np.exp(-0.004 * (time_diff - 180)))
+            # Calculate time-based matching factor
+            # More flexible time model that accounts for typical café-to-shop behavior
+            if time_diff <= 60:  # Quick transitions (under a minute)
+                time_factor = 0.9  # High probability
+            elif time_diff <= 180:  # Normal transitions (1-3 minutes)
+                time_factor = 0.8  # Medium-high probability
+            elif time_diff <= 600:  # Extended transitions (3-10 minutes)
+                # Linear decay from 0.7 to 0.4
+                time_factor = 0.7 - 0.3 * ((time_diff - 180) / 420)
+            else:  # Long transitions (over 10 minutes)
+                # Exponential decay but maintain possibility
+                time_factor = 0.4 * np.exp(-0.001 * (time_diff - 600))
             
             # Combined similarity score with balanced weights
-            similarity = (0.65 * feature_sim +
+            similarity = (0.55 * feature_sim +      # Reduced to make room for other factors
                           0.15 * color_sim +
-                          0.10 * time_factor +
+                          0.15 * time_factor +
                           transition_bonus)
             
             # Apply threshold for cross-camera matching 
-            if similarity > self.cross_camera_threshold and similarity > best_match_score:
-                best_match_id = global_id
-                best_match_score = similarity
+            if similarity > self.cross_camera_threshold:
+                if similarity > best_match_score:
+                    # Move current best to second best
+                    second_best_match_id = best_match_id
+                    second_best_match_score = best_match_score
+                    # Update best
+                    best_match_id = global_id
+                    best_match_score = similarity
+                elif similarity > second_best_match_score:
+                    # Update second best
+                    second_best_match_id = global_id
+                    second_best_match_score = similarity
+        
+        # Check for ambiguous matches (first and second best are very close)
+        if (best_match_id is not None and second_best_match_id is not None and
+            best_match_score - second_best_match_score < 0.1 and 
+            camera_id == 2):  # Only for shop matches where ambiguity matters more
+            
+            # Resolve ambiguity with additional checks
+            best_match_time_diff = self._get_transition_time(best_match_id, timestamp)
+            second_best_time_diff = self._get_transition_time(second_best_match_id, timestamp)
+            
+            # Prefer match with better timing if times are significantly different
+            if abs(best_match_time_diff - second_best_time_diff) > 120:  # Over 2 minutes difference
+                if self._is_better_transition_time(second_best_time_diff, best_match_time_diff):
+                    # Swap best and second best
+                    best_match_id, second_best_match_id = second_best_match_id, best_match_id
+                    best_match_score, second_best_match_score = second_best_match_score, best_match_score
         
         # Create new global identity if no match found
         if best_match_id is None:
@@ -270,7 +366,45 @@ class GlobalTracker:
         
         # Register the global identity for this camera-specific track
         self.global_identities[camera_key] = best_match_id
+        
+        # Update exit/entry likelihoods
+        if camera_id == 1:
+            # For Camera 1 tracks, store exit likelihood based on position
+            self.cafe_exit_likelihood[camera_key] = 0.8 if camera_key in self.door_exits else 0.3
+        elif camera_id == 2:
+            # For Camera 2 tracks, store entry likelihood based on position
+            self.shop_entry_likelihood[camera_key] = 0.8 if camera_key in self.door_entries else 0.3
+        
         return best_match_id
+        
+    def _get_time_category(self, time_diff):
+        """Categorize transition time into predefined buckets"""
+        if time_diff <= 30:
+            return '0-30'
+        elif time_diff <= 60:
+            return '30-60'
+        elif time_diff <= 180:
+            return '60-180'
+        elif time_diff <= 600:
+            return '180-600'
+        else:
+            return '600+'
+            
+    def _get_transition_time(self, global_id, current_timestamp):
+        """Get transition time from last appearance of this global ID"""
+        if global_id not in self.appearance_sequence or not self.appearance_sequence[global_id]:
+            return float('inf')
+            
+        last_appearance = self.appearance_sequence[global_id][-1]
+        return current_timestamp - last_appearance['timestamp']
+        
+    def _is_better_transition_time(self, time1, time2):
+        """Determine if time1 is a more likely transition time than time2"""
+        # Define ideal transition time around 1 minute
+        ideal_time = 60
+        
+        # Simple comparison based on distance from ideal time
+        return abs(time1 - ideal_time) < abs(time2 - ideal_time)
 
     def analyze_camera_transitions(self):
         """Analyze transitions between cameras with fine-tuned validation."""
@@ -339,6 +473,7 @@ class GlobalTracker:
         """
         Clean up by merging similar identities based on feature similarity.
         Uses natural similarity thresholds instead of forcing a target count.
+        Highly conservative with Camera 1 (café) to avoid undercounting.
         """
         # Find all global IDs 
         camera1_global_ids = set()
@@ -365,19 +500,37 @@ class GlobalTracker:
             sorted_ids = sorted(list(global_ids))
             
             # Set similarity threshold based on camera environment
-            # Camera 1 needs a higher threshold to preserve identities
-            threshold = 0.85 if camera_id == 1 else 0.72
+            # Camera 1 (café) needs a much higher threshold to preserve identities due to partial visibility
+            if camera_id == 1:
+                threshold = 0.94   # Extremely high threshold to avoid merging different people
+                max_overlap_pct = 0.05  # Almost no temporal overlap allowed for merging
+                max_sequence_merge = 2  # Limit how many merges can occur in a sequence
+            else:
+                threshold = 0.75   # Moderate threshold for Camera 2 (shop)
+                max_overlap_pct = 0.2  # Moderate temporal overlap allowed
+                max_sequence_merge = 5  # More merges allowed for Camera 2
                 
             logger.info(f"Cleaning Camera {camera_id} identities with threshold {threshold}")
+            
+            # Track number of merges per identity to limit chain merging
+            merge_counts = defaultdict(int)
             
             # For each pair of identities, check if they should be merged
             for i, id1 in enumerate(sorted_ids):
                 if id1 in merged_ids:
                     continue
+                
+                # Skip if already merged too many times (prevents chain merging)
+                if merge_counts[id1] >= max_sequence_merge:
+                    continue
                     
                 for j in range(i+1, len(sorted_ids)):
                     id2 = sorted_ids[j]
                     if id2 in merged_ids:
+                        continue
+                    
+                    # Skip if already merged too many times
+                    if merge_counts[id2] >= max_sequence_merge:
                         continue
                     
                     # Get all camera appearances
@@ -393,19 +546,65 @@ class GlobalTracker:
                     times1 = sorted([a['timestamp'] for a in appearances1])
                     times2 = sorted([a['timestamp'] for a in appearances2])
                     
-                    # Check if there's significant overlap
-                    # Avoid merging tracks with significant temporal overlap
-                    overlap_start = max(times1[0], times2[0])
-                    overlap_end = min(times1[-1], times2[-1])
-                    overlap_duration = max(0, overlap_end - overlap_start)
+                    # Skip if the two tracks are too far apart in time (likely different people)
+                    if camera_id == 1:  # For café
+                        max_time_separation = 600  # 10 minutes max between tracks
+                    else:
+                        max_time_separation = 1200  # 20 minutes max for shop
+                        
+                    min_time_diff = min(
+                        abs(times1[0] - times2[-1]),
+                        abs(times2[0] - times1[-1])
+                    )
+                    
+                    if min_time_diff > max_time_separation:
+                        # Skip merging tracks that are too far apart in time
+                        continue
+                    
+                    # Check if there's significant overlap - calculate differently for café
+                    if camera_id == 1:  # For café with partial visibility
+                        # Calculate overlap with enhanced logic
+                        if times1[-1] < times2[0] or times2[-1] < times1[0]:
+                            # No overlap at all
+                            overlap_duration = 0
+                        else:
+                            # Some overlap
+                            overlap_start = max(times1[0], times2[0])
+                            overlap_end = min(times1[-1], times2[-1])
+                            overlap_duration = max(0, overlap_end - overlap_start)
+                            
+                            # For café: if tracks have strong feature similarity but some temporal overlap,
+                            # check if one could have been sitting at a table outside view during overlap
+                            if overlap_duration > 0:
+                                # Get track keys for these global IDs
+                                keys1 = [k for k, v in self.global_identities.items() 
+                                       if v == id1 and k.startswith(f"{camera_id}_")]
+                                keys2 = [k for k, v in self.global_identities.items() 
+                                       if v == id2 and k.startswith(f"{camera_id}_")]
+                                
+                                # Check if either likely moved to table area (outside camera view)
+                                table_likelihood1 = any(k in self.cafe_exit_likelihood and 
+                                                      self.cafe_exit_likelihood[k] > 0.5 for k in keys1)
+                                table_likelihood2 = any(k in self.cafe_exit_likelihood and 
+                                                      self.cafe_exit_likelihood[k] > 0.5 for k in keys2)
+                                
+                                # If either likely moved to table, reduce effective overlap duration
+                                if table_likelihood1 or table_likelihood2:
+                                    overlap_duration *= 0.5  # Reduce effective overlap
+                    else:
+                        # Standard overlap calculation for shop
+                        if times1[-1] < times2[0] or times2[-1] < times1[0]:
+                            overlap_duration = 0
+                        else:
+                            overlap_start = max(times1[0], times2[0])
+                            overlap_end = min(times1[-1], times2[-1])
+                            overlap_duration = max(0, overlap_end - overlap_start)
                     
                     # Calculate total durations
                     duration1 = times1[-1] - times1[0]
                     duration2 = times2[-1] - times2[0]
                     
-                    # Allow merging if no overlap or very small overlap
-                    # Camera 1 needs stricter overlap checks due to crowd density
-                    max_overlap_pct = 0.1 if camera_id == 1 else 0.25  
+                    # Allow merging if minimal temporal overlap
                     can_merge_time = overlap_duration < max_overlap_pct * min(duration1, duration2)
                     
                     if not can_merge_time:
@@ -423,13 +622,54 @@ class GlobalTracker:
                         max_dist = 2.0  # Approximate maximum distance for normalized features
                         l2_sim = 1.0 - min(l2_dist / max_dist, 1.0)
                         
-                        # Weighted combination of similarity metrics
-                        feature_sim = 0.75 * cosine_sim + 0.25 * l2_sim
+                        # Check historical features too for better matching
+                        max_hist_sim = 0
+                        if id1 in self.feature_history and id2 in self.feature_history:
+                            for feat1 in self.feature_history[id1]:
+                                for feat2 in self.feature_history[id2]:
+                                    hist_cosine = 1 - cosine(feat1.flatten(), feat2.flatten())
+                                    hist_l2 = 1.0 - min(np.linalg.norm(feat1.flatten() - feat2.flatten()) / max_dist, 1.0)
+                                    hist_sim = 0.75 * hist_cosine + 0.25 * hist_l2
+                                    max_hist_sim = max(max_hist_sim, hist_sim)
+                        
+                        # Combine current and historical similarities
+                        feature_sim = max(0.75 * cosine_sim + 0.25 * l2_sim, 0.9 * max_hist_sim)
+                        
+                        # For Camera 1, add additional check for color similarity
+                        if camera_id == 1 and feature_sim > threshold * 0.95:  # Close to threshold
+                            # Check color histograms too for café identities
+                            color_sim = 0
+                            
+                            # Get camera keys for these global IDs
+                            keys1 = [k for k, v in self.global_identities.items() 
+                                   if v == id1 and k.startswith(f"{camera_id}_")]
+                            keys2 = [k for k, v in self.global_identities.items() 
+                                   if v == id2 and k.startswith(f"{camera_id}_")]
+                            
+                            # Find most recent color histograms
+                            for k1 in keys1:
+                                for k2 in keys2:
+                                    if k1 in self.color_features and k2 in self.color_features:
+                                        if len(self.color_features[k1]) > 0 and len(self.color_features[k2]) > 0:
+                                            c1 = self.color_features[k1][-1]
+                                            c2 = self.color_features[k2][-1]
+                                            current_sim = 1 - cosine(c1.flatten(), c2.flatten())
+                                            color_sim = max(color_sim, current_sim)
+                            
+                            # Adjust threshold based on color similarity
+                            if color_sim > 0.7:  # Good color match
+                                effective_threshold = threshold * 0.97  # Slightly lower threshold
+                            else:
+                                effective_threshold = threshold * 1.03  # Slightly higher threshold
+                        else:
+                            effective_threshold = threshold
                         
                         # Merge if similarity is high enough
-                        if feature_sim > threshold:
+                        if feature_sim > effective_threshold:
                             merged_ids.add(id2)
                             id_mappings[id2] = id1
+                            # Track merge counts to prevent chain merging
+                            merge_counts[id1] += 1
                             logger.debug(f"Merging identity {id2} into {id1}, similarity: {feature_sim:.4f}")
             
             # Log how many identities were merged for this camera
@@ -453,10 +693,34 @@ class GlobalTracker:
                     self.appearance_sequence[new_id].extend(self.appearance_sequence[old_id])
                     del self.appearance_sequence[old_id]
                     
+                # Combine feature histories
+                if old_id in self.feature_history and new_id in self.feature_history:
+                    self.feature_history[new_id].extend(self.feature_history[old_id])
+                    # Limit to max history length
+                    if len(self.feature_history[new_id]) > self.max_features_history:
+                        self.feature_history[new_id] = self.feature_history[new_id][-self.max_features_history:]
+                    del self.feature_history[old_id]
+                
                 # Update feature database - keep the target feature
                 if old_id in self.feature_database:
                     # Just delete the source feature, keeping the target
                     del self.feature_database[old_id]
+                    
+                # Transfer café exit and shop entry likelihoods
+                for key in keys_to_update:
+                    if key in self.cafe_exit_likelihood:
+                        # Find corresponding key for new_id
+                        new_keys = [k for k, v in self.global_identities.items() if v == new_id and k.startswith(key.split('_')[0])]
+                        if new_keys:
+                            # Transfer the higher exit likelihood
+                            current = self.cafe_exit_likelihood.get(new_keys[0], 0)
+                            self.cafe_exit_likelihood[new_keys[0]] = max(current, self.cafe_exit_likelihood[key])
+                    
+                    if key in self.shop_entry_likelihood:
+                        new_keys = [k for k, v in self.global_identities.items() if v == new_id and k.startswith(key.split('_')[0])]
+                        if new_keys:
+                            current = self.shop_entry_likelihood.get(new_keys[0], 0)
+                            self.shop_entry_likelihood[new_keys[0]] = max(current, self.shop_entry_likelihood[key])
             
             # Recalculate counts after merging
             new_camera1_ids = set()
@@ -538,52 +802,87 @@ class PersonTracker:
         self.track_positions = defaultdict(list)  # Position history
         self.next_id = 0  # Next track ID
         
+        # Track environment features
+        self.scene_activity = defaultdict(list)  # Capture general scene activity
+        self.motion_patterns = defaultdict(list)  # Track motion patterns
+        self.door_activity_history = []  # Timeline of door activity
+        self.appear_disappear_locations = []  # Track where people appear/disappear
+        
         # Door regions specific to each camera
         self.door_regions = {
             1: [(1030, 0), (1700, 560)],  # Camera 1 door
             2: [(400, 0), (800, 470)]     # Camera 2 door
         }
         
+        # Extended regions of interest for Camera 1 (tables near door)
+        if self.camera_id == 1:
+            # Define regions where people might sit down (outside visible area)
+            self.table_regions = [
+                [(950, 300), (1200, 560)],   # Left table area
+                [(1200, 300), (1500, 560)]   # Right table area
+            ]
+        
         # Door interaction tracking
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters
-        if self.camera_id == 1:  # Café environment - more challenging
-            # Parameters optimized for café environment
-            self.detection_threshold = 0.25  # Lower threshold to detect more people
-            self.matching_threshold = 0.35   # Lower to avoid identity switches
-            self.feature_weight = 0.80       # Higher weight on appearance features
-            self.position_weight = 0.20      # Lower weight on position
-            self.max_disappeared = self.fps * 8  # Allow longer disappearance
-            self.max_lost_age = self.fps * 30    # Keep lost tracks longer
-            self.merge_threshold = 0.85   # Higher threshold to avoid merging different people
-        else:  # Food shop environment - simpler environment
-            # Parameters for simpler environment
-            self.detection_threshold = 0.45  # Standard detection threshold
+        # Set camera-specific tracking parameters based on environment
+        if self.camera_id == 1:  # Café environment - very challenging with partial coverage
+            # Extremely permissive parameters for café with tables outside view
+            self.detection_threshold = 0.15  # Very low threshold to detect more people
+            self.matching_threshold = 0.30   # Lower to avoid identity switches
+            self.feature_weight = 0.85       # Much higher weight on appearance features
+            self.position_weight = 0.15      # Lower weight on position
+            self.max_disappeared = self.fps * 10  # Allow longer disappearance times
+            self.max_lost_age = self.fps * 45     # Keep lost tracks much longer
+            self.merge_threshold = 0.92   # Very high threshold to prevent merging different people
+            
+            # For handling lighting variations in café
+            self.use_lighting_compensation = True
+            self.use_enhanced_color_features = True
+            self.use_texture_features = True
+        else:  # Food shop environment - simpler with full coverage
+            # More standard parameters for shop environment
+            self.detection_threshold = 0.40  # Standard detection threshold
             self.matching_threshold = 0.50   # Standard matching threshold
             self.feature_weight = 0.70       # Balanced feature weight
             self.position_weight = 0.30      # Balanced position weight
             self.max_disappeared = self.fps * 5   # Standard disappearance allowance
             self.max_lost_age = self.fps * 20     # Standard lost track age
-            self.merge_threshold = 0.55   # Standard merge threshold
+            self.merge_threshold = 0.65   # Slightly higher threshold for better accuracy
+            
+            # Lighting handling for shop
+            self.use_lighting_compensation = False
+            self.use_enhanced_color_features = False
+            self.use_texture_features = False
             
         # Track quality thresholds - critical for proper counting
         if self.camera_id == 1:
-            self.min_track_duration = 0.5  # Allow shorter tracks in busy café
-            self.min_detections = 2        # Require very few detections
+            # Extremely permissive for café since people might be briefly visible
+            self.min_track_duration = 0.2   # Accept very brief tracks in café
+            self.min_detections = 2         # Require minimal detections
+            self.count_door_interactions = True  # Count even brief door interactions
+            self.count_disappeared_tracks = True  # Count tracks that disappear near tables
         else:
-            self.min_track_duration = 2.0  # Require longer tracks in shop
-            self.min_detections = 5        # Require more detections
+            # Standard thresholds for shop
+            self.min_track_duration = 1.5   # Require reasonable track duration in shop
+            self.min_detections = 4         # Require more detections for confidence
+            self.count_door_interactions = False
+            self.count_disappeared_tracks = False
         
-        # Track consolidation parameters
-        self.consolidation_frequency = 25 if self.camera_id == 1 else 15
+        # Track consolidation parameters - very infrequent for Camera 1
+        self.consolidation_frequency = 50 if self.camera_id == 1 else 15
         
-        # RTX 4090 Optimizations
-        self.use_mixed_precision = True    # Use FP16 for faster inference
-        self.feature_res = (256, 512)      # Higher resolution for better features
-        self.use_multi_scale = True        # Use multi-scale features
-        self.multi_scale_factors = [0.8, 1.0, 1.2]  # Scale factors
+        # Multi-scale and feature optimization parameters
+        self.use_mixed_precision = True
+        self.feature_res = (256, 512)
+        self.use_multi_scale = True
+        
+        # Expanded multi-scale factors for Camera 1 to handle lighting variations
+        if self.camera_id == 1:
+            self.multi_scale_factors = [0.7, 0.85, 1.0, 1.15, 1.3]  # More scales for café
+        else:
+            self.multi_scale_factors = [0.8, 1.0, 1.2]  # Standard scales for shop
         
         # Create CUDA streams for parallel processing
         if torch.cuda.is_available():
@@ -623,6 +922,7 @@ class PersonTracker:
     def extract_features(self, person_crop):
         """
         Extract ReID features from a person image with RTX 4090 optimizations.
+        Additional lighting compensation for Camera 1's variable lighting conditions.
         
         Args:
             person_crop: Cropped image of a person
@@ -634,9 +934,45 @@ class PersonTracker:
             if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
                 return None
             
+            # Apply lighting compensation for Camera 1
+            if self.camera_id == 1 and self.use_lighting_compensation:
+                # CLAHE (Contrast Limited Adaptive Histogram Equalization) for better contrast
+                lab = cv2.cvtColor(person_crop, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                cl = clahe.apply(l)
+                enhanced = cv2.merge((cl, a, b))
+                person_crop = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+                
+                # Gamma correction to balance lighting
+                gamma = 1.2  # Adjust gamma to enhance features
+                inv_gamma = 1.0 / gamma
+                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
+                person_crop = cv2.LUT(person_crop, table)
+            
             # Basic preprocessing with higher resolution
             img = cv2.resize(person_crop, self.feature_res)  # Higher resolution (256x512)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Extract texture-based features for Camera 1 if enabled
+            texture_features = None
+            if self.camera_id == 1 and self.use_texture_features:
+                # LBP (Local Binary Pattern) for texture encoding
+                gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+                # Compute simplified texture features
+                texture_features = np.zeros((8, 8), dtype=np.float32)
+                h, w = gray.shape
+                cell_h, cell_w = h // 8, w // 8
+                for i in range(8):
+                    for j in range(8):
+                        # Calculate mean gradient magnitude in each cell as texture feature
+                        cell = gray[i*cell_h:min((i+1)*cell_h, h), j*cell_w:min((j+1)*cell_w, w)]
+                        if cell.size > 0:
+                            gx = cv2.Sobel(cell, cv2.CV_32F, 1, 0)
+                            gy = cv2.Sobel(cell, cv2.CV_32F, 0, 1)
+                            mag = np.sqrt(gx**2 + gy**2)
+                            texture_features[i, j] = np.mean(mag)
+                texture_features = texture_features.flatten() / (texture_features.max() + 1e-6)
             
             # Convert to tensor
             img = torch.from_numpy(img).float() / 255.0
@@ -661,7 +997,16 @@ class PersonTracker:
                 else:
                     features = self.reid_model(img)
                 
-            return features.cpu().numpy()
+            # Combine with texture features if available
+            reid_features = features.cpu().numpy()
+            if texture_features is not None:
+                # Normalize and reshape texture features to match reid features shape
+                texture_features = texture_features.reshape(1, -1)
+                # We'll add texture features as additional inputs to the matching process
+                # Store them separately to be used in matching
+                self.last_texture_features = texture_features
+                
+            return reid_features
         except Exception as e:
             logger.error(f"Error extracting features: {e}")
             return None
@@ -730,7 +1075,8 @@ class PersonTracker:
 
     def extract_color_histogram(self, person_crop):
         """
-        Extract color histogram features from a person image.
+        Extract enhanced color histogram features from a person image.
+        For Camera 1, uses advanced techniques to handle varying lighting conditions.
         
         Args:
             person_crop: Cropped image of a person
@@ -741,21 +1087,77 @@ class PersonTracker:
         try:
             if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
                 return None
+            
+            # Enhanced color processing for Camera 1 with lighting variations
+            if self.camera_id == 1 and self.use_enhanced_color_features:
+                # Convert to Lab color space which separates luminance from color
+                lab = cv2.cvtColor(person_crop, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
                 
-            # Convert to HSV for better color representation
-            hsv = cv2.cvtColor(person_crop, cv2.COLOR_BGR2HSV)
-            
-            # Calculate histograms for each channel - using more bins for RTX 4090
-            hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180])  # More bins (32 instead of 16)
-            hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256])
-            hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256])
-            
-            # Normalize histograms
-            hist_h = cv2.normalize(hist_h, hist_h).flatten()
-            hist_s = cv2.normalize(hist_s, hist_s).flatten()
-            hist_v = cv2.normalize(hist_v, hist_v).flatten()
-            
-            return np.concatenate([hist_h, hist_s, hist_v])
+                # Calculate histograms with focus on color channels (a, b) which are less affected by lighting
+                hist_l = cv2.calcHist([l], [0], None, [24], [0, 256])
+                hist_a = cv2.calcHist([a], [0], None, [36], [0, 256])
+                hist_b = cv2.calcHist([b], [0], None, [36], [0, 256])
+                
+                # Normalize histograms
+                hist_l = cv2.normalize(hist_l, hist_l).flatten()
+                hist_a = cv2.normalize(hist_a, hist_a).flatten()
+                hist_b = cv2.normalize(hist_b, hist_b).flatten()
+                
+                # Use a spatial pyramid for upper and lower body separately (people often have different colors)
+                h, w = person_crop.shape[:2]
+                upper_body = person_crop[0:h//2, :]
+                lower_body = person_crop[h//2:, :]
+                
+                # Process upper body color
+                if upper_body.size > 0:
+                    hsv_upper = cv2.cvtColor(upper_body, cv2.COLOR_BGR2HSV)
+                    hist_h_upper = cv2.calcHist([hsv_upper], [0], None, [24], [0, 180])
+                    hist_s_upper = cv2.calcHist([hsv_upper], [1], None, [24], [0, 256])
+                    hist_h_upper = cv2.normalize(hist_h_upper, hist_h_upper).flatten()
+                    hist_s_upper = cv2.normalize(hist_s_upper, hist_s_upper).flatten()
+                else:
+                    hist_h_upper = np.zeros(24)
+                    hist_s_upper = np.zeros(24)
+                
+                # Process lower body color
+                if lower_body.size > 0:
+                    hsv_lower = cv2.cvtColor(lower_body, cv2.COLOR_BGR2HSV)
+                    hist_h_lower = cv2.calcHist([hsv_lower], [0], None, [24], [0, 180])
+                    hist_s_lower = cv2.calcHist([hsv_lower], [1], None, [24], [0, 256])
+                    hist_h_lower = cv2.normalize(hist_h_lower, hist_h_lower).flatten()
+                    hist_s_lower = cv2.normalize(hist_s_lower, hist_s_lower).flatten()
+                else:
+                    hist_h_lower = np.zeros(24)
+                    hist_s_lower = np.zeros(24)
+                
+                # Create lighting-robust color descriptor
+                return np.concatenate([
+                    hist_l * 0.5,      # Reduce weight of luminance (lighting dependent)
+                    hist_a * 1.2,      # Increase weight of a channel (green-red)
+                    hist_b * 1.2,      # Increase weight of b channel (blue-yellow)
+                    hist_h_upper,      # Upper body hue
+                    hist_s_upper,      # Upper body saturation
+                    hist_h_lower,      # Lower body hue
+                    hist_s_lower       # Lower body saturation
+                ])
+                
+            else:
+                # Standard HSV histogram for Camera 2
+                hsv = cv2.cvtColor(person_crop, cv2.COLOR_BGR2HSV)
+                
+                # Calculate histograms for each channel
+                hist_h = cv2.calcHist([hsv], [0], None, [32], [0, 180])
+                hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256])
+                hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256])
+                
+                # Normalize histograms
+                hist_h = cv2.normalize(hist_h, hist_h).flatten()
+                hist_s = cv2.normalize(hist_s, hist_s).flatten()
+                hist_v = cv2.normalize(hist_v, hist_v).flatten()
+                
+                return np.concatenate([hist_h, hist_s, hist_v])
+                
         except Exception as e:
             logger.error(f"Error extracting color histogram: {e}")
             return None
@@ -1213,7 +1615,8 @@ class PersonTracker:
 
     def filter_detection(self, bbox, conf):
         """
-        Filter out invalid detections.
+        Filter out invalid detections with camera-specific criteria.
+        Much more permissive for Camera 1 due to partial visibility and lighting issues.
         
         Args:
             bbox: Bounding box coordinates [x1, y1, x2, y2]
@@ -1226,41 +1629,85 @@ class PersonTracker:
         width = x2 - x1
         height = y2 - y1
         
-        # Size checks - fine-tuned for each camera
-        # Camera 1 needs more lenient checks
+        # Get the center of the box
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        # Size checks - extremely lenient for Camera 1 café
         if self.camera_id == 1:
-            if width < 25 or height < 45:  # More lenient size requirements
+            # Very permissive size filtering for café where people might be partially visible
+            if width < 15 or height < 30:
                 return False
         else:
-            if width < 30 or height < 50:  # Standard size requirements
+            # Standard size requirements for shop with full visibility
+            if width < 30 or height < 50:
                 return False
             
         # Check aspect ratio (typical human aspect ratio)
         aspect_ratio = height / width
-        # Camera 1 needs wider range due to closer people and varied poses
-        min_aspect = 1.2 if self.camera_id == 1 else 1.4
-        max_aspect = 3.5 if self.camera_id == 1 else 3.0
         
+        # Camera 1 needs much wider aspect ratio range due to partial visibility and various poses
+        if self.camera_id == 1:
+            min_aspect = 1.0  # Accept almost square detections (partial visibility)
+            max_aspect = 4.0  # Accept extremely tall and narrow detections
+            
+            # Special case: Always accept detections near door region regardless of aspect ratio
+            if self.is_in_door_region(bbox):
+                # Still enforce minimal sanity checks
+                if width >= 15 and height >= 30 and aspect_ratio > 0.5 and aspect_ratio < 5.0:
+                    return True
+                    
+            # Special case: Accept detections near table areas with different criteria
+            for table_region in self.table_regions:
+                tx1, ty1 = table_region[0]
+                tx2, ty2 = table_region[1]
+                # Check if detection center is near table region
+                if (tx1 - 50 <= center_x <= tx2 + 50) and (ty1 - 50 <= center_y <= ty2 + 50):
+                    # More permissive criteria for table regions
+                    if width >= 15 and height >= 30 and aspect_ratio > 0.8 and aspect_ratio < 4.5:
+                        return True
+        else:
+            # Standard aspect ratio checks for shop
+            min_aspect = 1.4
+            max_aspect = 3.0
+            
         if aspect_ratio < min_aspect or aspect_ratio > max_aspect:
             return False
             
         # Filter out detections with too large or too small areas
         area = width * height
-        # Area thresholds based on typical human sizes
-        min_area = 600 if self.camera_id == 1 else 1500  # More lenient for Camera 1
-        max_area = 0.35 * self.frame_width * self.frame_height # Adaptive max area
+        
+        # Area thresholds - extremely permissive for Camera 1
+        if self.camera_id == 1:
+            min_area = 450  # Accept very small detections in café
+            # Larger max area for café since people might be closer to camera
+            max_area = 0.45 * self.frame_width * self.frame_height
+        else:
+            min_area = 1500  # Standard minimum for shop
+            max_area = 0.35 * self.frame_width * self.frame_height
         
         if area < min_area or area > max_area:
             return False
             
-        # Camera-specific checks
+        # Camera-specific edge checks
         if self.camera_id == 1:
-            # For café (Camera 1) - mostly concerned with side edges
-            edge_margin = 5  # Minimal edge filtering
+            # For café (Camera 1) - mostly minimal edge filtering
+            edge_margin = 2  # Almost no edge filtering for café
+            
             if x1 < edge_margin or x2 > self.frame_width - edge_margin:
-                # Allow if in door region
+                # Check if near door or table regions
                 if self.is_in_door_region(bbox):
                     return True
+                    
+                # Check if near table regions where people might disappear
+                for table_region in self.table_regions:
+                    tx1, ty1 = table_region[0]
+                    tx2, ty2 = table_region[1]
+                    # Allow if near table region
+                    if (tx1 - 100 <= center_x <= tx2 + 100) and (ty1 - 100 <= center_y <= ty2 + 100):
+                        return True
+                
+                # Still strict about image edges away from doors/tables
                 return False
         else:
             # For food shop (Camera 2) - more concerned with top edge
@@ -1463,15 +1910,18 @@ class PersonTracker:
     def get_valid_tracks(self):
         """
         Get valid tracks that meet quality criteria.
+        Camera 1 uses special logic to count partial tracks near tables/doors.
         
         Returns:
             Dictionary of valid tracks
         """
         # Get valid tracks
         valid_tracks = {}
+        processed_tracks = set()
         
         all_tracks = set(self.track_timestamps.keys())
         
+        # First pass: Standard validation
         for track_id in all_tracks:
             # Skip tracks that are too short - camera-specific
             duration = (self.track_timestamps[track_id]['last_appearance'] - 
@@ -1494,6 +1944,75 @@ class PersonTracker:
                     'is_exit': track_id in self.door_exits,
                     'detections': len(self.feature_history.get(track_id, []))
                 }
+                processed_tracks.add(track_id)
+        
+        # Second pass for Camera 1: Special handling for tracks that interact with doors or disappear near tables
+        if self.camera_id == 1:
+            # Enhanced track validation for café environment
+            for track_id in all_tracks:
+                if track_id in processed_tracks:
+                    continue
+                    
+                # Skip tracks with too few detections (maintain minimal quality)
+                if track_id not in self.feature_history or len(self.feature_history[track_id]) < self.min_detections:
+                    continue
+                
+                # Check for door interactions
+                if self.count_door_interactions and (track_id in self.door_entries or track_id in self.door_exits):
+                    # Accept tracks that interact with doors even if they're short
+                    duration = (self.track_timestamps[track_id]['last_appearance'] - 
+                              self.track_timestamps[track_id]['first_appearance'])
+                    # Still enforce minimal duration
+                    if duration >= self.min_track_duration * 0.5:  # Half the normal duration requirement
+                        valid_tracks[track_id] = {
+                            'id': track_id,
+                            'features': self.person_features.get(track_id),
+                            'color_histogram': self.color_histograms.get(track_id),
+                            'first_appearance': self.track_timestamps[track_id]['first_appearance'],
+                            'last_appearance': self.track_timestamps[track_id]['last_appearance'],
+                            'duration': duration,
+                            'is_entry': track_id in self.door_entries,
+                            'is_exit': track_id in self.door_exits,
+                            'detections': len(self.feature_history.get(track_id, []))
+                        }
+                        processed_tracks.add(track_id)
+                        continue
+                
+                # Check for tracks that disappear near table regions (people sitting down outside camera view)
+                if self.count_disappeared_tracks and track_id in self.track_positions and len(self.track_positions[track_id]) > 0:
+                    # Check if last position is near a table region
+                    last_pos = self.track_positions[track_id][-1]
+                    center_x = (last_pos[0] + last_pos[2]) / 2
+                    center_y = (last_pos[1] + last_pos[3]) / 2
+                    
+                    near_table = False
+                    for table_region in self.table_regions:
+                        tx1, ty1 = table_region[0]
+                        tx2, ty2 = table_region[1]
+                        # Check if detection center is near table region
+                        if (tx1 - 150 <= center_x <= tx2 + 150) and (ty1 - 150 <= center_y <= ty2 + 150):
+                            near_table = True
+                            break
+                    
+                    if near_table:
+                        # Accept tracks that disappear near tables
+                        duration = (self.track_timestamps[track_id]['last_appearance'] - 
+                                  self.track_timestamps[track_id]['first_appearance'])
+                        # Still enforce minimal quality
+                        if duration >= self.min_track_duration * 0.5 and len(self.feature_history[track_id]) >= self.min_detections:
+                            valid_tracks[track_id] = {
+                                'id': track_id,
+                                'features': self.person_features.get(track_id),
+                                'color_histogram': self.color_histograms.get(track_id),
+                                'first_appearance': self.track_timestamps[track_id]['first_appearance'],
+                                'last_appearance': self.track_timestamps[track_id]['last_appearance'],
+                                'duration': duration,
+                                'is_entry': track_id in self.door_entries,
+                                'is_exit': track_id in self.door_exits,
+                                'detections': len(self.feature_history.get(track_id, [])),
+                                'near_table': True  # Mark as disappearing near table
+                            }
+                            processed_tracks.add(track_id)
         
         logger.info("Camera %d: Identified %d valid tracks out of %d total tracks",
                    self.camera_id, len(valid_tracks), len(all_tracks))
