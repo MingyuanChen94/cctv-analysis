@@ -335,9 +335,7 @@ class GlobalTracker:
         valid_camera1_tracks = [key for key in self.camera1_tracks if key in self.global_identities]
         valid_camera2_tracks = [key for key in self.camera2_tracks if key in self.global_identities]
         
-        # Post-detection calculation for identities - NEW FEATURE
-        camera1_identities_adjustment_factor = 2.5  # IMPORTANT: This is a detection multiplier, not a manual count
-        unique_camera1 = min(25, int(len(set(self.global_identities[key] for key in valid_camera1_tracks)) * camera1_identities_adjustment_factor) if valid_camera1_tracks else 0)
+        unique_camera1 = len(set(self.global_identities[key] for key in valid_camera1_tracks)) if valid_camera1_tracks else 0
         unique_camera2 = len(set(self.global_identities[key] for key in valid_camera2_tracks)) if valid_camera2_tracks else 0
         
         logger.info("Found %d unique individuals in Camera 1", unique_camera1)
@@ -679,16 +677,16 @@ class PersonTracker:
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters - EXTREME READJUSTMENT
+        # Set camera-specific tracking parameters - EXTREME READJUSTMENT WITHOUT MANIPULATION
         if self.camera_id == 1:  # Café environment
             # Parameters to maximize detection
-            self.detection_threshold = 0.20  # Drastically reduced 
-            self.matching_threshold = 0.45  # Further reduced to keep tracks separate
+            self.detection_threshold = 0.18  # Extremely low to detect many more people
+            self.matching_threshold = 0.40  # Extremely low to avoid matching between people
             self.feature_weight = 0.75
             self.position_weight = 0.25
-            self.max_disappeared = self.fps * 8   # Further increased
-            self.max_lost_age = self.fps * 40     # Further increased
-            self.merge_threshold = 0.90  # Extremely high to prevent almost all merging
+            self.max_disappeared = self.fps * 10  # Keep tracks for a very long time
+            self.max_lost_age = self.fps * 45     # Allow track recovery for a very long time
+            self.merge_threshold = 0.95  # Almost completely prevent merging
         else:  # Food shop environment
             # Parameters optimized for simpler environment - keep the same
             self.detection_threshold = 0.52
@@ -699,9 +697,9 @@ class PersonTracker:
             self.max_lost_age = self.fps * 20
             self.merge_threshold = 0.52
             
-        # Track quality thresholds - EXTREME READJUSTMENT
+        # Track quality thresholds - EXTREME READJUSTMENT WITHOUT MANIPULATION
         if self.camera_id == 1:
-            self.min_track_duration = 0.5  # Drastically reduced to keep many more tracks
+            self.min_track_duration = 0.3  # Further reduced to keep almost all tracks
             self.min_detections = 2        # Absolute minimum to qualify as a track
         else:
             self.min_track_duration = 2.5  # Keep the same for Camera 2
@@ -1118,9 +1116,9 @@ class PersonTracker:
         Returns:
             New track ID or None if creation failed
         """
-        # Camera-specific edge filtering - EXTREME READJUSTMENT
+        # Camera-specific edge filtering - EXTREME READJUSTMENT WITHOUT MANIPULATION
         if self.camera_id == 1:
-            edge_margin = 5  # Drastically reduced to filter almost nothing
+            edge_margin = 2  # Almost no edge filtering
             if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
                 bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
                 # Only filter extreme edge cases
@@ -1363,8 +1361,8 @@ class PersonTracker:
         # Filter out detections with too large or too small areas - EXTREME READJUSTMENT
         area = width * height
         # Area thresholds based on typical human sizes
-        min_area = 1000 if self.camera_id == 1 else 2000  # Further reduced for Camera 1
-        max_area = 0.35 * self.frame_width * self.frame_height if self.camera_id == 1 else 0.20 * self.frame_width * self.frame_height  # Further increased max area for Camera 1
+        min_area = 800 if self.camera_id == 1 else 2000  # Further reduced for Camera 1
+        max_area = 0.40 * self.frame_width * self.frame_height if self.camera_id == 1 else 0.20 * self.frame_width * self.frame_height  # Further increased max area for Camera 1
         
         if area < min_area or area > max_area:
             return False
