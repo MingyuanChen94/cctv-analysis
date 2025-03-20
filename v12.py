@@ -41,10 +41,10 @@ class GlobalTracker:
         # Stores color histograms for each identity
         self.color_features = {}
         
-        # Parameters for cross-camera matching - IMPROVED APPROACH
-        self.min_transition_time = 25       # Increased to be more selective
-        self.max_transition_time = 900      # Back to 15 minutes
-        self.cross_camera_threshold = 0.65  # More strict threshold to reduce transitions
+        # Parameters for cross-camera matching - CRITICAL ADJUSTMENT
+        self.min_transition_time = 10       # Reduced to catch more transitions
+        self.max_transition_time = 1200     # Extended to 20 minutes
+        self.cross_camera_threshold = 0.50  # Reduced to catch more transitions
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -189,8 +189,8 @@ class GlobalTracker:
             # Combined feature similarity - weighted average - MODIFIED
             feature_sim = 0.7 * cosine_sim + 0.3 * l2_sim
             
-            # Skip if feature similarity is below threshold - IMPROVED APPROACH
-            if feature_sim < 0.55:  # Increased to be more selective
+            # Skip if feature similarity is below threshold - CRITICAL ADJUSTMENT
+            if feature_sim < 0.45:  # Reduced to catch more transitions
                 continue
             
             # For Camera 1 to Camera 2 transitions, check door interactions
@@ -312,11 +312,11 @@ class GlobalTracker:
                             if time_diff > 300 and not is_door_valid:
                                 continue
                         
-                        # IMPROVED APPROACH: Require door validation
+                        # CRITICAL ADJUSTMENT: Relax transition validation
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
-                        # Only accept transitions with at least door validation
-                        if transition_score >= 2:  # Require door validation
+                        # Accept all transitions with any validation
+                        if transition_score >= 1:  # Just require some validation
                             valid_transitions.append({
                                 'global_id': global_id,
                                 'exit_time': current['timestamp'],
@@ -678,16 +678,16 @@ class PersonTracker:
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters - IMPROVED APPROACH
+        # Set camera-specific tracking parameters - CRITICAL ADJUSTMENT
         if self.camera_id == 1:  # Café environment
-            # Parameters to maximize detection while preventing identity collapse
-            self.detection_threshold = 0.15  # Further reduced
-            self.matching_threshold = 0.35  # Further reduced to keep tracks separate
-            self.feature_weight = 0.80      # Increased feature weight (was 0.75)
-            self.position_weight = 0.20     # Reduced position weight (was 0.25)
-            self.max_disappeared = self.fps * 12  # Extended further
-            self.max_lost_age = self.fps * 50     # Extended further
-            self.merge_threshold = 0.99  # Maximum possible value
+            # Extreme parameters to maximize detection 
+            self.detection_threshold = 0.08  # Drastically reduced
+            self.matching_threshold = 0.30  # Extremely low to keep identities separate
+            self.feature_weight = 0.85      # Very high feature weight
+            self.position_weight = 0.15     # Very low position weight
+            self.max_disappeared = self.fps * 15  # Extended much further
+            self.max_lost_age = self.fps * 60     # Extended to 1 minute
+            self.merge_threshold = 1.0  # No merging whatsoever
         else:  # Food shop environment
             # Parameters optimized for simpler environment - keep the same
             self.detection_threshold = 0.52
@@ -907,8 +907,11 @@ class PersonTracker:
         x_min, y_min = door[0]
         x_max, y_max = door[1]
         
-        # IMPROVED APPROACH: Moderate buffer
-        buffer = 80  # More moderate value
+        # CRITICAL ADJUSTMENT: Camera-specific buffer sizes
+        if self.camera_id == 1:
+            buffer = 120  # Much larger for Camera 1
+        else:
+            buffer = 80   # Moderate for Camera 2
         
         return (x_min - buffer <= center_x <= x_max + buffer and 
                 y_min - buffer <= center_y <= y_max + buffer)
@@ -923,16 +926,28 @@ class PersonTracker:
         Returns:
             Tuple of (is_entering, is_exiting) booleans
         """
-        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 3:  # IMPROVED APPROACH
+        # CRITICAL ADJUSTMENT: Different criteria by camera
+        if self.camera_id == 1:
+            min_positions = 2  # Minimum positions to check for Camera 1
+        else:
+            min_positions = 3  # Standard for Camera 2
+            
+        if track_id not in self.track_positions or len(self.track_positions[track_id]) < min_positions:
             return False, False
             
-        # Get first few and last few positions - IMPROVED APPROACH
-        first_positions = self.track_positions[track_id][:3]  # First 3 positions 
-        last_positions = self.track_positions[track_id][-3:]  # Last 3 positions
+        # Get first few and last few positions
+        first_positions = self.track_positions[track_id][:min_positions]
+        last_positions = self.track_positions[track_id][-min_positions:]
         
-        # IMPROVED APPROACH: Moderately strict door detection
-        is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= 2  # Need at least 2
-        is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= 2    # Need at least 2
+        # CRITICAL ADJUSTMENT: Different detection criteria by camera
+        if self.camera_id == 1:
+            # Extremely lenient for Camera 1
+            is_entering = any(self.is_in_door_region(pos) for pos in first_positions)
+            is_exiting = any(self.is_in_door_region(pos) for pos in last_positions)
+        else:
+            # More strict for Camera 2
+            is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= 2
+            is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= 2
         
         return is_entering, is_exiting
 
