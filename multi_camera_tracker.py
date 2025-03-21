@@ -267,11 +267,19 @@ class GlobalTracker:
             color_sim = 0
             if camera_key in self.color_features and len(self.color_features[camera_key]) > 0:
                 camera1_keys = [k for k, v in self.global_identities.items() 
-                              if v == global_id and k.startswith('1_')]
+                            if v == global_id and k.startswith('1_')]
                 if camera1_keys and camera1_keys[0] in self.color_features and len(self.color_features[camera1_keys[0]]) > 0:
                     color_feats1 = self.color_features[camera1_keys[0]][-1]
                     color_feats2 = self.color_features[camera_key][-1]
-                    color_sim = 1 - cosine(color_feats1.flatten(), color_feats2.flatten())
+                    
+                    # Add this shape check to avoid dimension mismatch
+                    if color_feats1.shape == color_feats2.shape:
+                        color_sim = 1 - cosine(color_feats1.flatten(), color_feats2.flatten())
+                    else:
+                        # Use shorter length to compare histograms of different sizes
+                        min_len = min(len(color_feats1), len(color_feats2))
+                        color_sim = 1 - cosine(color_feats1[:min_len].flatten(), color_feats2[:min_len].flatten())
+    
             
             # Calculate time-based factor for transition time assessment
             if time_diff <= 180:  # For transitions up to 3 minutes
@@ -458,6 +466,9 @@ class GlobalTracker:
         merges_performed = 0
         
         # Simple threshold-based merging without target count
+        # Add this check to handle None value
+        if threshold is None:
+            threshold = 0.63  # Default value if None
         logger.info(f"Merging similar Camera 1 identities with threshold {threshold}")
         
         # For each pair of identities, check if they should be merged
@@ -2427,6 +2438,17 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_came
     Returns:
         Dictionary containing analysis results
     """
+    if len(global_tracker.camera1_tracks) > 0:
+        camera1_merge_threshold = 0.63  # Start with a default value
+        if params and 'camera1_merge_threshold' in params:
+            camera1_merge_threshold = params['camera1_merge_threshold']
+        elif params:
+            camera_params = {k[8:]: v for k, v in params.items() if k.startswith('camera1_')}
+            if 'merge_threshold' in camera_params:
+                camera1_merge_threshold = camera_params['merge_threshold']
+        
+        global_tracker.merge_similar_identities_in_camera1(threshold=camera1_merge_threshold)
+        
     # If no output directory specified, use the input directory
     if output_dir is None:
         output_dir = input_dir
