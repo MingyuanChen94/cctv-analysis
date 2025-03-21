@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import torch
 import torchreid
+from ultralytics import YOLO  # Explicitly import YOLO
 from collections import defaultdict
 from scipy.spatial.distance import cosine
 from pathlib import Path
@@ -20,6 +21,20 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('MultiCameraTracker')
+
+# Custom JSON encoder to handle NumPy types
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy types"""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super(NumpyEncoder, self).default(obj)
 
 class TrackingState:
     """States for person tracking."""
@@ -1423,10 +1438,10 @@ class ParameterOptimizer:
         weighted_error = (0.5 * transition_error + 0.3 * camera1_error + 0.2 * camera2_error)
         
         return weighted_error, {
-            'camera1_error': camera1_error,
-            'camera2_error': camera2_error,
-            'transition_error': transition_error,
-            'weighted_error': weighted_error
+            'camera1_error': float(camera1_error),
+            'camera2_error': float(camera2_error),
+            'transition_error': float(transition_error),
+            'weighted_error': float(weighted_error)
         }
 
     def sample_parameters(self, iteration):
@@ -1442,18 +1457,18 @@ class ParameterOptimizer:
         # For the first few iterations, try more varied parameters
         if iteration < 5:
             params = {
-                'camera1_detection_threshold': np.random.choice(self.param_spaces['camera1_detection_threshold']),
-                'camera1_matching_threshold': np.random.choice(self.param_spaces['camera1_matching_threshold']),
-                'camera1_merge_threshold': np.random.choice(self.param_spaces['camera1_merge_threshold']),
-                'camera1_min_track_duration': np.random.choice(self.param_spaces['camera1_min_track_duration']),
-                'camera1_min_detections': np.random.choice(self.param_spaces['camera1_min_detections']),
+                'camera1_detection_threshold': float(np.random.choice(self.param_spaces['camera1_detection_threshold'])),
+                'camera1_matching_threshold': float(np.random.choice(self.param_spaces['camera1_matching_threshold'])),
+                'camera1_merge_threshold': float(np.random.choice(self.param_spaces['camera1_merge_threshold'])),
+                'camera1_min_track_duration': float(np.random.choice(self.param_spaces['camera1_min_track_duration'])),
+                'camera1_min_detections': int(np.random.choice(self.param_spaces['camera1_min_detections'])),
                 
-                'camera2_detection_threshold': np.random.choice(self.param_spaces['camera2_detection_threshold']),
-                'camera2_matching_threshold': np.random.choice(self.param_spaces['camera2_matching_threshold']),
-                'camera2_merge_threshold': np.random.choice(self.param_spaces['camera2_merge_threshold']),
+                'camera2_detection_threshold': float(np.random.choice(self.param_spaces['camera2_detection_threshold'])),
+                'camera2_matching_threshold': float(np.random.choice(self.param_spaces['camera2_matching_threshold'])),
+                'camera2_merge_threshold': float(np.random.choice(self.param_spaces['camera2_merge_threshold'])),
                 
-                'cross_camera_threshold': np.random.choice(self.param_spaces['cross_camera_threshold']),
-                'min_transition_time': np.random.choice(self.param_spaces['min_transition_time']),
+                'cross_camera_threshold': float(np.random.choice(self.param_spaces['cross_camera_threshold'])),
+                'min_transition_time': int(np.random.choice(self.param_spaces['min_transition_time'])),
             }
         else:
             # If we have some history, focus on parameter regions that worked better
@@ -1462,42 +1477,42 @@ class ParameterOptimizer:
                 variation = 0.1 if iteration < 20 else 0.05  # Reduce variation over time
                 
                 params = {
-                    'camera1_detection_threshold': max(0.2, min(0.5, self.best_params['camera1_detection_threshold'] + np.random.uniform(-variation, variation))),
-                    'camera1_matching_threshold': max(0.4, min(0.7, self.best_params['camera1_matching_threshold'] + np.random.uniform(-variation, variation))),
-                    'camera1_merge_threshold': max(0.5, min(0.75, self.best_params['camera1_merge_threshold'] + np.random.uniform(-variation, variation))),
-                    'camera1_min_track_duration': max(0.8, min(2.2, self.best_params['camera1_min_track_duration'] + np.random.uniform(-0.3, 0.3))),
-                    'camera1_min_detections': max(2, min(5, round(self.best_params['camera1_min_detections'] + np.random.randint(-1, 2)))),
+                    'camera1_detection_threshold': float(max(0.2, min(0.5, self.best_params['camera1_detection_threshold'] + np.random.uniform(-variation, variation)))),
+                    'camera1_matching_threshold': float(max(0.4, min(0.7, self.best_params['camera1_matching_threshold'] + np.random.uniform(-variation, variation)))),
+                    'camera1_merge_threshold': float(max(0.5, min(0.75, self.best_params['camera1_merge_threshold'] + np.random.uniform(-variation, variation)))),
+                    'camera1_min_track_duration': float(max(0.8, min(2.2, self.best_params['camera1_min_track_duration'] + np.random.uniform(-0.3, 0.3)))),
+                    'camera1_min_detections': int(max(2, min(5, round(self.best_params['camera1_min_detections'] + np.random.randint(-1, 2))))),
                     
-                    'camera2_detection_threshold': max(0.3, min(0.55, self.best_params['camera2_detection_threshold'] + np.random.uniform(-variation, variation))),
-                    'camera2_matching_threshold': max(0.5, min(0.7, self.best_params['camera2_matching_threshold'] + np.random.uniform(-variation, variation))),
-                    'camera2_merge_threshold': max(0.5, min(0.7, self.best_params['camera2_merge_threshold'] + np.random.uniform(-variation, variation))),
+                    'camera2_detection_threshold': float(max(0.3, min(0.55, self.best_params['camera2_detection_threshold'] + np.random.uniform(-variation, variation)))),
+                    'camera2_matching_threshold': float(max(0.5, min(0.7, self.best_params['camera2_matching_threshold'] + np.random.uniform(-variation, variation)))),
+                    'camera2_merge_threshold': float(max(0.5, min(0.7, self.best_params['camera2_merge_threshold'] + np.random.uniform(-variation, variation)))),
                     
-                    'cross_camera_threshold': max(0.6, min(0.85, self.best_params['cross_camera_threshold'] + np.random.uniform(-variation, variation))),
-                    'min_transition_time': max(5, min(35, round(self.best_params['min_transition_time'] + np.random.randint(-5, 6)))),
+                    'cross_camera_threshold': float(max(0.6, min(0.85, self.best_params['cross_camera_threshold'] + np.random.uniform(-variation, variation)))),
+                    'min_transition_time': int(max(5, min(35, round(self.best_params['min_transition_time'] + np.random.randint(-5, 6))))),
                 }
             else:
                 # Random sampling from parameter spaces
                 params = {
-                    'camera1_detection_threshold': np.random.choice(self.param_spaces['camera1_detection_threshold']),
-                    'camera1_matching_threshold': np.random.choice(self.param_spaces['camera1_matching_threshold']),
-                    'camera1_merge_threshold': np.random.choice(self.param_spaces['camera1_merge_threshold']),
-                    'camera1_min_track_duration': np.random.choice(self.param_spaces['camera1_min_track_duration']),
-                    'camera1_min_detections': np.random.choice(self.param_spaces['camera1_min_detections']),
+                    'camera1_detection_threshold': float(np.random.choice(self.param_spaces['camera1_detection_threshold'])),
+                    'camera1_matching_threshold': float(np.random.choice(self.param_spaces['camera1_matching_threshold'])),
+                    'camera1_merge_threshold': float(np.random.choice(self.param_spaces['camera1_merge_threshold'])),
+                    'camera1_min_track_duration': float(np.random.choice(self.param_spaces['camera1_min_track_duration'])),
+                    'camera1_min_detections': int(np.random.choice(self.param_spaces['camera1_min_detections'])),
                     
-                    'camera2_detection_threshold': np.random.choice(self.param_spaces['camera2_detection_threshold']),
-                    'camera2_matching_threshold': np.random.choice(self.param_spaces['camera2_matching_threshold']),
-                    'camera2_merge_threshold': np.random.choice(self.param_spaces['camera2_merge_threshold']),
+                    'camera2_detection_threshold': float(np.random.choice(self.param_spaces['camera2_detection_threshold'])),
+                    'camera2_matching_threshold': float(np.random.choice(self.param_spaces['camera2_matching_threshold'])),
+                    'camera2_merge_threshold': float(np.random.choice(self.param_spaces['camera2_merge_threshold'])),
                     
-                    'cross_camera_threshold': np.random.choice(self.param_spaces['cross_camera_threshold']),
-                    'min_transition_time': np.random.choice(self.param_spaces['min_transition_time']),
+                    'cross_camera_threshold': float(np.random.choice(self.param_spaces['cross_camera_threshold'])),
+                    'min_transition_time': int(np.random.choice(self.param_spaces['min_transition_time'])),
                 }
         
         # Add some parameter relationships for better consistency
         # Ensure detection threshold is lower than matching threshold
-        params['camera1_detection_threshold'] = min(params['camera1_detection_threshold'], 
-                                                  params['camera1_matching_threshold'] - 0.05)
-        params['camera2_detection_threshold'] = min(params['camera2_detection_threshold'], 
-                                                  params['camera2_matching_threshold'] - 0.05)
+        params['camera1_detection_threshold'] = float(min(params['camera1_detection_threshold'], 
+                                                  params['camera1_matching_threshold'] - 0.05))
+        params['camera2_detection_threshold'] = float(min(params['camera2_detection_threshold'], 
+                                                  params['camera2_matching_threshold'] - 0.05))
         
         return params
 
@@ -1657,13 +1672,13 @@ class ParameterOptimizer:
                 'iteration': iteration,
                 'params': params,
                 'results': {
-                    'camera1_count': results['unique_camera1'],
-                    'camera2_count': results['unique_camera2'],
-                    'transitions': results['transitions']['camera1_to_camera2']
+                    'camera1_count': int(results['unique_camera1']),
+                    'camera2_count': int(results['unique_camera2']),
+                    'transitions': int(results['transitions']['camera1_to_camera2'])
                 },
-                'error': error,
+                'error': float(error),
                 'error_details': error_details,
-                'processing_time': end_time - start_time
+                'processing_time': float(end_time - start_time)
             }
             
             self.results_history.append(iteration_result)
@@ -1680,11 +1695,12 @@ class ParameterOptimizer:
                 # Save the best parameters so far
                 with open(os.path.join(opt_dir, 'best_params.json'), 'w') as f:
                     json.dump({
-                        'params': params,
+                        'params': {k: float(v) if isinstance(v, (np.floating, float)) else int(v) 
+                                 for k, v in params.items()},
                         'results': iteration_result['results'],
-                        'error': error,
+                        'error': float(error),
                         'iteration': iteration
-                    }, f, indent=4)
+                    }, f, indent=4, cls=NumpyEncoder)
             
             # Log progress
             if iteration % 5 == 0 or iteration == self.max_iterations - 1:
@@ -1696,7 +1712,7 @@ class ParameterOptimizer:
         
         # Save all results
         with open(os.path.join(opt_dir, 'optimization_history.json'), 'w') as f:
-            json.dump(self.results_history, f, indent=4)
+            json.dump(self.results_history, f, indent=4, cls=NumpyEncoder)
         
         # Run one final time with the best parameters
         if self.best_params:
@@ -1709,13 +1725,14 @@ class ParameterOptimizer:
                            f"Transitions={final_results['transitions']['camera1_to_camera2']}")
             
             return {
-                'best_params': self.best_params,
+                'best_params': {k: float(v) if isinstance(v, (np.floating, float)) else int(v) 
+                               for k, v in self.best_params.items()},
                 'results': {
-                    'camera1_count': final_results['unique_camera1'],
-                    'camera2_count': final_results['unique_camera2'],
-                    'transitions': final_results['transitions']['camera1_to_camera2']
+                    'camera1_count': int(final_results['unique_camera1']),
+                    'camera2_count': int(final_results['unique_camera2']),
+                    'transitions': int(final_results['transitions']['camera1_to_camera2'])
                 },
-                'error': self.best_error
+                'error': float(self.best_error)
             }
         
         return None
@@ -1882,7 +1899,7 @@ def process_video_directory(input_dir, output_dir=None, params=None):
         }
         
         with open(json_path, 'w') as f:
-            json.dump(results, f, indent=4)
+            json.dump(results, f, indent=4, cls=NumpyEncoder)
         
         logger.info(f"Date {date} results: Camera1={transition_analysis['unique_camera1']}, "
                    f"Camera2={transition_analysis['unique_camera2']}, "
@@ -1989,7 +2006,7 @@ def main():
                 
                 # Save the best parameters to a file
                 with open(os.path.join(output_dir, 'best_parameters.json'), 'w') as f:
-                    json.dump(best_config, f, indent=4)
+                    json.dump(best_config, f, indent=4, cls=NumpyEncoder)
                 
                 # Use the results from optimization
                 results = {
