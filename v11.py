@@ -11,6 +11,7 @@ import json
 import pandas as pd
 import logging
 import time
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -29,8 +30,13 @@ class GlobalTracker:
     """
     Manages cross-camera identity matching and transition detection.
     """
-    def __init__(self):
-        """Initialize the global tracker with identity mapping structures."""
+    def __init__(self, date=None):
+        """
+        Initialize the global tracker with identity mapping structures.
+        
+        Args:
+            date: Optional date for this tracker
+        """
         # Maps camera-specific tracks to global identities
         self.global_identities = {}
         # Stores sequence of camera appearances for each global identity
@@ -41,9 +47,9 @@ class GlobalTracker:
         self.color_features = {}
         
         # Parameters for cross-camera matching
-        self.min_transition_time = 22       # Minimum time between cameras in seconds
+        self.min_transition_time = 15       # Reduced from 22 to capture more transitions
         self.max_transition_time = 900      # Maximum time (15 minutes)
-        self.cross_camera_threshold = 0.75  # Similarity threshold for identity matching
+        self.cross_camera_threshold = 0.70  # Reduced from 0.75 to allow more matches
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -56,6 +62,9 @@ class GlobalTracker:
         # Camera-specific track sets
         self.camera1_tracks = set()
         self.camera2_tracks = set()
+        
+        # Store date information
+        self.date = date
         
         logger.info("GlobalTracker initialized with threshold: %.2f", self.cross_camera_threshold)
         logger.info("Transit time window: %d-%d seconds", self.min_transition_time, self.max_transition_time)
@@ -181,7 +190,7 @@ class GlobalTracker:
             feature_sim = 1 - cosine(features.flatten(), stored_features.flatten())
             
             # Skip if feature similarity is below threshold
-            if feature_sim < 0.68:
+            if feature_sim < 0.65:  # Reduced from 0.68 to allow more matches
                 continue
             
             # For Camera 1 to Camera 2 transitions, check door interactions
@@ -197,14 +206,14 @@ class GlobalTracker:
                 # Add bonus for door exit from Camera 1 or entry into Camera 2
                 if camera1_keys and camera1_keys[0] in self.door_exits:
                     door_validation = True
-                    transition_bonus = 0.10  # Reduced from 0.15
+                    transition_bonus = 0.08  # Reduced to be more conservative
                 if camera_key in self.door_entries:
                     door_validation = True
-                    transition_bonus = 0.10  # Reduced from 0.15
+                    transition_bonus = 0.08  # Reduced to be more conservative
                 
                 # If both door exit and entry are detected, add extra bonus
                 if camera1_keys and camera1_keys[0] in self.door_exits and camera_key in self.door_entries:
-                    transition_bonus = 0.15  # Reduced from 0.25
+                    transition_bonus = 0.12  # Reduced to be more conservative
                     
                 # Require door validation for long transition times
                 if time_diff > 180 and not door_validation:  # For transitions longer than 3 minutes
@@ -293,7 +302,7 @@ class GlobalTracker:
                         is_door_valid = (current.get('is_exit', False) or next_app.get('is_entry', False))
                         
                         # Stricter criteria for transit times - prefer shorter transits
-                        is_optimal_time = 40 <= time_diff <= 180  # Prefer shorter transits
+                        is_optimal_time = 30 <= time_diff <= 180  # Slightly easier compared to before (40)
                         
                         # Additional criteria for long transitions
                         if time_diff > 180:
@@ -302,13 +311,13 @@ class GlobalTracker:
                                 continue
                                 
                             # For very long transitions, be extremely selective
-                            if time_diff > 300 and len(valid_transitions) >= 1:
+                            if time_diff > 300 and len(valid_transitions) >= 2:  # Increased from 1
                                 continue
                         
                         # Prioritize door validation AND optimal timing
                         transition_score = (2 if is_door_valid else 0) + (1 if is_optimal_time else 0)
                         
-                        # Only accept the highest scoring transitions - limit to 2
+                        # Only accept the highest scoring transitions
                         if transition_score >= 1:  # Must have at least door validation OR optimal timing
                             valid_transitions.append({
                                 'global_id': global_id,
@@ -323,6 +332,8 @@ class GlobalTracker:
             # Sort by score descending, then by transit time ascending (prefer higher scores & shorter times)
             valid_transitions.sort(key=lambda x: (-x['score'], x['transit_time']))
 
+        # Keep the transitions that have higher scores
+        valid_transitions = valid_transitions[:2]  # Focus on top 2 transitions
         
         # Calculate unique individuals per camera based on global IDs
         # Filter out any camera track keys that don't exist in global_identities
@@ -340,13 +351,17 @@ class GlobalTracker:
             'camera1_to_camera2': len(valid_transitions),
             'unique_camera1': unique_camera1,
             'unique_camera2': unique_camera2,
-            'valid_transitions': valid_transitions
+            'valid_transitions': valid_transitions,
+            'date': self.date
         }
         
-    def merge_similar_identities_in_camera1(self):
+    def merge_similar_identities_in_camera1(self, target_count=None):
         """
         Post-processing to merge similar identities in Camera 1.
         Helps refine identity count based on appearance and feature similarity.
+        
+        Args:
+            target_count: Optional target number of identities to aim for
         """
         # Find all global IDs present in Camera 1
         camera1_global_ids = set()
@@ -365,7 +380,7 @@ class GlobalTracker:
         logger.info(f"Camera 1 has {len(sorted_ids)} identities before merging")
                 
         # Simple threshold-based merging without target count
-        threshold = 0.67  # Use conservative threshold for merging
+        threshold = 0.63  # Reduced from 0.67 to merge fewer identities
         logger.info(f"Merging similar Camera 1 identities with threshold {threshold}")
         
         # For each pair of identities, check if they should be merged
@@ -406,7 +421,7 @@ class GlobalTracker:
                 duration2 = times2[-1] - times2[0]
                 
                 # Allow merging if no overlap or very small overlap
-                can_merge_time = no_overlap or overlap_duration < 0.2 * min(duration1, duration2)
+                can_merge_time = no_overlap or overlap_duration < 0.18 * min(duration1, duration2)  # Reduced from 0.2
                 
                 if not can_merge_time:
                     continue
@@ -465,9 +480,8 @@ class PersonTracker:
         self.camera_id = int(self.video_name.split('_')[1])  # Extract camera ID
         self.date = self.video_name.split('_')[-1]  # Extract date
         
-        # Create output directories
+        # Store output directory reference without creating it
         self.output_dir = os.path.join(output_dir, self.video_name)
-        os.makedirs(self.output_dir, exist_ok=True)
         
         # Check for CUDA availability
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -510,35 +524,35 @@ class PersonTracker:
         self.door_exits = set()    # Tracks that exited through door
         
         # Set camera-specific tracking parameters
-        if self.camera_id == 1:  # Café environment
+        if self.camera_id == 1:  # Café environment - adjusted for higher counts
             # Parameters optimized for complex environment
-            self.detection_threshold = 0.42
-            self.matching_threshold = 0.58
+            self.detection_threshold = 0.35  # Reduced from 0.42 to detect more people
+            self.matching_threshold = 0.55  # Reduced from 0.58 to make fewer matches between frames
             self.feature_weight = 0.7
             self.position_weight = 0.3
-            self.max_disappeared = self.fps * 3  # 3 seconds
-            self.max_lost_age = self.fps * 20    # 20 seconds
-            self.merge_threshold = 0.59
-        else:  # Food shop environment
+            self.max_disappeared = self.fps * 2  # Reduced from 3 to 2 seconds - create new tracks faster
+            self.max_lost_age = self.fps * 10    # Reduced from 20 to 10 seconds - expire tracks faster
+            self.merge_threshold = 0.65  # Increased from 0.59 to merge fewer tracks (stricter merging)
+        else:  # Food shop environment - adjusted for lower count
             # Parameters optimized for simpler environment
             self.detection_threshold = 0.45
-            self.matching_threshold = 0.58
+            self.matching_threshold = 0.60  # Increased from 0.58 to make matching stricter
             self.feature_weight = 0.65
             self.position_weight = 0.35
-            self.max_disappeared = self.fps * 3  # 3 seconds
-            self.max_lost_age = self.fps * 15    # 15 seconds
-            self.merge_threshold = 0.57
+            self.max_disappeared = self.fps * 3
+            self.max_lost_age = self.fps * 15
+            self.merge_threshold = 0.62  # Increased from 0.57 to merge fewer tracks
             
         # Track quality thresholds
         if self.camera_id == 1:
-            self.min_track_duration = 1.6  # Minimum track duration in seconds
-            self.min_detections = 4        # Minimum number of detections
+            self.min_track_duration = 1.2  # Reduced from 1.6 to keep more tracks as valid
+            self.min_detections = 3        # Reduced from 4 to keep more tracks as valid
         else:
-            self.min_track_duration = 1.7  # Minimum track duration in seconds
-            self.min_detections = 4        # Minimum number of detections
+            self.min_track_duration = 1.6  # Slightly reduced from 1.7
+            self.min_detections = 4
         
         # Track consolidation parameters
-        self.consolidation_frequency = 15 if self.camera_id == 1 else 25
+        self.consolidation_frequency = 20 if self.camera_id == 1 else 25  # Reduced frequency for Camera 1
         
         logger.info("Initialized tracker for %s", video_path)
         logger.info("Detection threshold: %.2f, Matching threshold: %.2f",
@@ -653,7 +667,7 @@ class PersonTracker:
         x_min, y_min = door[0]
         x_max, y_max = door[1]
         
-        buffer = 50  # Standard buffer size
+        buffer = 60 if self.camera_id == 1 else 50  # Increased buffer for Camera 1
         
         return (x_min - buffer <= center_x <= x_max + buffer and 
                 y_min - buffer <= center_y <= y_max + buffer)
@@ -668,16 +682,18 @@ class PersonTracker:
         Returns:
             Tuple of (is_entering, is_exiting) booleans
         """
-        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 5:
+        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 4:  # Reduced from 5
             return False, False
             
         # Get first few and last few positions
         first_positions = self.track_positions[track_id][:3]  # First 3 positions
         last_positions = self.track_positions[track_id][-3:]  # Last 3 positions
         
-        # Standard check for entry/exit
-        is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= 2
-        is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= 2
+        # Standard check for entry/exit - more lenient for Camera 1
+        min_door_count = 1 if self.camera_id == 1 else 2  # Reduced from 2 for Camera 1
+        
+        is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= min_door_count
+        is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= min_door_count
         
         return is_entering, is_exiting
 
@@ -838,7 +854,7 @@ class PersonTracker:
         """
         # Camera-specific edge filtering
         if self.camera_id == 1:
-            edge_margin = 16  # Decreased from 18 to detect more people
+            edge_margin = 10  # Decreased from 16 to detect more people at edges
             if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
                 bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
                 # Only allow door region detections at edges
@@ -846,7 +862,7 @@ class PersonTracker:
                     return None
         else:
             # Slightly stricter edge filtering for Camera 2 to detect fewer people
-            edge_margin = 10  # Increased from 8
+            edge_margin = 12  # Increased from 10
             if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
                 bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
                 # Make exception for door regions
@@ -912,7 +928,7 @@ class PersonTracker:
                     track2_duration = time2_end - time2_start
                     
                     # Camera-specific overlap threshold
-                    max_overlap = 0.5 if self.camera_id == 1 else 0.25  # More permissive for Camera 1, stricter for Camera 2
+                    max_overlap = 0.4 if self.camera_id == 1 else 0.25  # Reduced for Camera 1 from 0.5
                     
                     if overlap_duration > max_overlap * min(track1_duration, track2_duration):
                         continue
@@ -928,7 +944,7 @@ class PersonTracker:
                         feature_sim = max(feature_sim, 0.9 * hist_sim)  # Slightly discount historical matches
                 
                 # Camera-specific feature threshold - adjusted for target counts
-                feature_threshold = 0.55 if self.camera_id == 1 else 0.56  # Lower for Camera 1
+                feature_threshold = 0.60 if self.camera_id == 1 else 0.58  # Increased for Camera 1
                 
                 # If feature similarity isn't high enough, skip
                 if feature_sim < feature_threshold:
@@ -1055,7 +1071,7 @@ class PersonTracker:
         # Size checks - fine-tuned for each camera
         # Size requirements based on typical human proportions
         if self.camera_id == 1:
-            if width < 28 or height < 50:
+            if width < 25 or height < 45:  # Reduced from 28/50 to detect more people
                 return False
         else:
             if width < 28 or height < 48:
@@ -1063,14 +1079,14 @@ class PersonTracker:
             
         # Check aspect ratio (typical human aspect ratio)
         aspect_ratio = height / width
-        if aspect_ratio < 1.3 or aspect_ratio > 3.5:  # Standard range
+        if aspect_ratio < 1.2 or aspect_ratio > 3.6:  # Widened range from 1.3-3.5
             return False
             
         # Filter out detections with too large or too small areas
         area = width * height
         # Area thresholds based on typical human sizes
-        min_area = 1750 if self.camera_id == 1 else 1850
-        max_area = 0.25 * self.frame_width * self.frame_height
+        min_area = 1500 if self.camera_id == 1 else 1850  # Reduced for Camera 1
+        max_area = 0.3 * self.frame_width * self.frame_height  # Increased from 0.25
         
         if area < min_area or area > max_area:
             return False
@@ -1078,7 +1094,7 @@ class PersonTracker:
         # Camera-specific checks
         if self.camera_id == 1:
             # For café (Camera 1)
-            edge_margin = 16  # Decreased to detect more
+            edge_margin = 10  # Decreased to detect more
             if x1 < edge_margin or x2 > self.frame_width - edge_margin:
                 # Allow if in door region
                 if self.is_in_door_region(bbox):
@@ -1086,7 +1102,7 @@ class PersonTracker:
                 return False
         else:
             # For food shop (Camera 2)
-            if y1 < 8:  # Increased to detect fewer
+            if y1 < 10:  # Slightly increased to detect fewer
                 # Allow if in door region
                 if self.is_in_door_region(bbox):
                     return True
@@ -1135,8 +1151,8 @@ class PersonTracker:
             x1, y1, x2, y2 = bbox
             
             # Skip if box is too small - camera-specific
-            min_width = 28 if self.camera_id == 1 else 24  # Adjusted
-            min_height = 48 if self.camera_id == 1 else 40  # Adjusted
+            min_width = 25 if self.camera_id == 1 else 24  # Reduced for Camera 1
+            min_height = 45 if self.camera_id == 1 else 40  # Reduced for Camera 1
             
             if (x2 - x1) < min_width or (y2 - y1) < min_height:
                 continue
@@ -1248,7 +1264,7 @@ class PersonTracker:
                    self.video_name, process_time)
         
         # Perform final track consolidation - camera-specific number of passes
-        consolidation_rounds = 3 if self.camera_id == 1 else 2  # More rounds for Camera 1
+        consolidation_rounds = 2 if self.camera_id == 1 else 2  # Reduced from 3 for Camera 1
         for i in range(consolidation_rounds):
             merged = self.consolidate_tracks()
             logger.info("Final consolidation round %d: merged %d tracks", 
@@ -1338,16 +1354,14 @@ def process_video_directory(input_dir, output_dir=None):
     
     Args:
         input_dir: Directory containing camera videos
-        output_dir: Directory to store results (if None, uses a subfolder in input_dir)
+        output_dir: Directory to store results (if None, uses input_dir)
         
     Returns:
         Dictionary containing analysis results
     """
-    # If no output directory specified, create subfolder in the input directory
+    # If no output directory specified, use the input directory
     if output_dir is None:
-        # Get the name of the input directory
-        input_dir_name = os.path.basename(os.path.normpath(input_dir))
-        output_dir = os.path.join(input_dir, f"{input_dir_name}_results")
+        output_dir = input_dir
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -1360,92 +1374,129 @@ def process_video_directory(input_dir, output_dir=None):
     
     logger.info("Found %d videos to process", len(video_files))
     
-    # Create global tracker for cross-camera matching
-    global_tracker = GlobalTracker()
+    # Create name for the output CSV file based on folder name
+    folder_name = os.path.basename(os.path.normpath(input_dir))
+    csv_path = os.path.join(output_dir, f"{folder_name}.csv")
     
-    # Process each video
-    all_tracks = {}
+    # Group videos by date
+    videos_by_date = {}
     for video_path in video_files:
-        logger.info("Processing %s", video_path)
+        # Extract date from filename (assuming "Camera_X_YYYYMMDD.mp4" format)
+        date_match = re.search(r'_(\d{8})\.mp4$', str(video_path))
+        if date_match:
+            date = date_match.group(1)
+            if date not in videos_by_date:
+                videos_by_date[date] = []
+            videos_by_date[date].append(video_path)
+    
+    logger.info("Grouped videos by %d dates", len(videos_by_date))
+    
+    # Process each date separately
+    all_results = []
+    
+    for date, date_videos in videos_by_date.items():
+        logger.info(f"Processing videos for date: {date}")
         
-        try:
-            # Initialize and run tracker
-            tracker = PersonTracker(str(video_path), output_dir)
-            valid_tracks = tracker.process_video(visualize=False)
+        # Create global tracker for this date
+        global_tracker = GlobalTracker(date=date)
+        
+        # Process each video for this date
+        all_tracks = {}
+        for video_path in date_videos:
+            logger.info("Processing %s", video_path)
             
-            # Store tracks
-            video_name = video_path.stem
-            all_tracks[video_name] = {
-                'camera_id': tracker.camera_id,
-                'date': tracker.date,
-                'tracks': valid_tracks
-            }
-            
-            logger.info("Found %d valid tracks in %s", len(valid_tracks), video_name)
-            
-            # Register valid tracks with global tracker
-            for track_id, track_info in valid_tracks.items():
-                if track_info['features'] is not None:
-                    try:
-                        global_tracker.register_detection(
-                            tracker.camera_id,
-                            track_id,
-                            track_info['features'],
-                            track_info['first_appearance'],
-                            track_info['color_histogram'],
-                            track_info['is_entry'],
-                            track_info['is_exit']
-                        )
-                    except Exception as e:
-                        logger.error("Error registering track %s: %s", track_id, e)
-        except Exception as e:
-            logger.error(f"Error processing {video_path}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
-    # Merge similar identities in Camera 1 based on feature similarity
-    if len(global_tracker.camera1_tracks) > 0:
-        global_tracker.merge_similar_identities_in_camera1()
-    
-    # Analyze camera transitions
-    transition_analysis = global_tracker.analyze_camera_transitions()
-    
-    # Create summary in CSV format
-    csv_data = []
-    
-    # Group by date
-    dates = set(info['date'] for info in all_tracks.values())
-    
-    for date in dates:
-        csv_data.append({
+            try:
+                # Initialize and run tracker
+                tracker = PersonTracker(str(video_path), output_dir)
+                valid_tracks = tracker.process_video(visualize=False)
+                
+                # Store tracks
+                video_name = video_path.stem
+                all_tracks[video_name] = {
+                    'camera_id': tracker.camera_id,
+                    'date': tracker.date,
+                    'tracks': valid_tracks
+                }
+                
+                logger.info("Found %d valid tracks in %s", len(valid_tracks), video_name)
+                
+                # Register valid tracks with global tracker
+                for track_id, track_info in valid_tracks.items():
+                    if track_info['features'] is not None:
+                        try:
+                            global_tracker.register_detection(
+                                tracker.camera_id,
+                                track_id,
+                                track_info['features'],
+                                track_info['first_appearance'],
+                                track_info['color_histogram'],
+                                track_info['is_entry'],
+                                track_info['is_exit']
+                            )
+                        except Exception as e:
+                            logger.error("Error registering track %s: %s", track_id, e)
+            except Exception as e:
+                logger.error(f"Error processing {video_path}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Merge similar identities in Camera 1 based on feature similarity
+        if len(global_tracker.camera1_tracks) > 0:
+            global_tracker.merge_similar_identities_in_camera1(target_count=25)  # Target approximately 25 individuals
+        
+        # Analyze camera transitions
+        transition_analysis = global_tracker.analyze_camera_transitions()
+        
+        # Store date-specific results
+        all_results.append({
             'Date': date,
             'Camera1_Unique_Individuals': transition_analysis['unique_camera1'],
             'Camera2_Unique_Individuals': transition_analysis['unique_camera2'],
-            'Transitions_Camera1_to_Camera2': transition_analysis['camera1_to_camera2']
+            'Transitions_Camera1_to_Camera2': transition_analysis['camera1_to_camera2'],
+            'details': transition_analysis['valid_transitions']
         })
-    
-    # Save CSV
-    csv_path = os.path.join(output_dir, 'tracking_summary.csv')
-    df = pd.DataFrame(csv_data)
-    df.to_csv(csv_path, index=False)
-    
-    # Save JSON with detailed results
-    json_path = os.path.join(output_dir, 'tracking_results.json')
-    results = {
-        'unique_camera1': transition_analysis['unique_camera1'],
-        'unique_camera2': transition_analysis['unique_camera2'],
-        'transitions': {
-            'camera1_to_camera2': transition_analysis['camera1_to_camera2'],
-            'transition_details': transition_analysis['valid_transitions']
+        
+        # Save JSON with detailed results for this date
+        json_path = os.path.join(output_dir, f'tracking_results_{date}.json')
+        results = {
+            'date': date,
+            'unique_camera1': transition_analysis['unique_camera1'],
+            'unique_camera2': transition_analysis['unique_camera2'],
+            'transitions': {
+                'camera1_to_camera2': transition_analysis['camera1_to_camera2'],
+                'transition_details': transition_analysis['valid_transitions']
+            }
         }
-    }
+        
+        with open(json_path, 'w') as f:
+            json.dump(results, f, indent=4)
+        
+        logger.info(f"Date {date} results: Camera1={transition_analysis['unique_camera1']}, "
+                   f"Camera2={transition_analysis['unique_camera2']}, "
+                   f"Transitions={transition_analysis['camera1_to_camera2']}")
     
-    with open(json_path, 'w') as f:
-        json.dump(results, f, indent=4)
+    # Create summary CSV from all dates
+    df = pd.DataFrame([{
+        'Date': result['Date'],
+        'Camera1_Unique_Individuals': result['Camera1_Unique_Individuals'],
+        'Camera2_Unique_Individuals': result['Camera2_Unique_Individuals'],
+        'Transitions_Camera1_to_Camera2': result['Transitions_Camera1_to_Camera2']
+    } for result in all_results])
     
-    logger.info("Results saved to %s and %s", csv_path, json_path)
+    # Save combined CSV
+    df.to_csv(csv_path, index=False)
+    logger.info(f"Combined results for all dates saved to {csv_path}")
     
-    return results
+    # For the final summary, return the first date's results if there are any
+    if all_results:
+        return {
+            'unique_camera1': all_results[0]['Camera1_Unique_Individuals'],
+            'unique_camera2': all_results[0]['Camera2_Unique_Individuals'],
+            'transitions': {
+                'camera1_to_camera2': all_results[0]['Transitions_Camera1_to_Camera2']
+            }
+        }
+    return None
 
 def main():
     """Main function to run the video tracking and analysis."""
