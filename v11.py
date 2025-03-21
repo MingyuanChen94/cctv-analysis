@@ -362,95 +362,65 @@ class GlobalTracker:
         sorted_ids = sorted(list(camera1_global_ids))
         
         # Count before merging
-        logger.info(f"Camera 1 has {len(sorted_ids)} identities before post-processing")
-        
-        # Target number of identities for Camera 1 based on environment assessment
-        target_count = 25
-        
-        # Calculate how many identities we need to merge
-        to_merge = len(sorted_ids) - target_count
-        merged_count = 0
-        
-        if to_merge <= 0:
-            # No need to merge if we have too few identities already
-            logger.info("No need to merge Camera 1 identities - count already at or below target")
-            return
-            
-        # If we have more than target, need to reduce by merging
-        if to_merge > 0:
-            logger.info(f"Need to merge approximately {to_merge} identities in Camera 1")
-            
-            # Multiple passes with decreasing thresholds to gradually approach target
-            thresholds = [0.67, 0.64, 0.62, 0.59]  # Slightly adjusted thresholds
-            
-            for threshold in thresholds:
-                if merged_count >= to_merge:
-                    break
-                    
-                logger.info(f"Merging Camera 1 identities with threshold {threshold}")
+        logger.info(f"Camera 1 has {len(sorted_ids)} identities before merging")
                 
-                # For each pair of identities, check if they should be merged
-                for i, id1 in enumerate(sorted_ids):
-                    if id1 in merged_ids:
-                        continue
-                        
-                    for j in range(i+1, len(sorted_ids)):
-                        id2 = sorted_ids[j]
-                        if id2 in merged_ids:
-                            continue
-                        
-                        # Get all camera 1 appearances
-                        appearances1 = [a for a in self.appearance_sequence.get(id1, []) 
-                                      if a['camera'] == f"Camera_1"]
-                        appearances2 = [a for a in self.appearance_sequence.get(id2, []) 
-                                      if a['camera'] == f"Camera_1"]
-                        
-                        if not appearances1 or not appearances2:
-                            continue
-                        
-                        # Check if appearances are temporally separated
-                        # (could be the same person at different times)
-                        times1 = sorted([a['timestamp'] for a in appearances1])
-                        times2 = sorted([a['timestamp'] for a in appearances2])
-                        
-                        # Check if there's significant overlap
-                        # If last time of 1 is before first time of 2 or vice versa, they don't overlap
-                        no_overlap = times1[-1] < times2[0] or times2[-1] < times1[0]
-                        
-                        # Find the overlap if any
-                        overlap_start = max(times1[0], times2[0])
-                        overlap_end = min(times1[-1], times2[-1])
-                        overlap_duration = max(0, overlap_end - overlap_start)
-                        
-                        # Calculate total durations
-                        duration1 = times1[-1] - times1[0]
-                        duration2 = times2[-1] - times2[0]
-                        
-                        # Allow merging if no overlap or very small overlap
-                        can_merge_time = no_overlap or overlap_duration < 0.2 * min(duration1, duration2)
-                        
-                        if not can_merge_time:
-                            continue
-                            
-                        # Compare features if both have feature representations
-                        if id1 in self.feature_database and id2 in self.feature_database:
-                            feature_sim = 1 - cosine(self.feature_database[id1].flatten(),
-                                                  self.feature_database[id2].flatten())
-                            
-                            # Merge if similarity is high enough
-                            if feature_sim > threshold:
-                                merged_ids.add(id2)
-                                id_mappings[id2] = id1
-                                logger.debug(f"Merging identity {id2} into {id1}, similarity: {feature_sim:.4f}")
-                                merged_count += 1
-                                
-                                # Check if we've reached our target
-                                if merged_count >= to_merge:
-                                    break
+        # Simple threshold-based merging without target count
+        threshold = 0.67  # Use conservative threshold for merging
+        logger.info(f"Merging similar Camera 1 identities with threshold {threshold}")
+        
+        # For each pair of identities, check if they should be merged
+        for i, id1 in enumerate(sorted_ids):
+            if id1 in merged_ids:
+                continue
+                
+            for j in range(i+1, len(sorted_ids)):
+                id2 = sorted_ids[j]
+                if id2 in merged_ids:
+                    continue
+                
+                # Get all camera 1 appearances
+                appearances1 = [a for a in self.appearance_sequence.get(id1, []) 
+                              if a['camera'] == f"Camera_1"]
+                appearances2 = [a for a in self.appearance_sequence.get(id2, []) 
+                              if a['camera'] == f"Camera_1"]
+                
+                if not appearances1 or not appearances2:
+                    continue
+                
+                # Check if appearances are temporally separated
+                # (could be the same person at different times)
+                times1 = sorted([a['timestamp'] for a in appearances1])
+                times2 = sorted([a['timestamp'] for a in appearances2])
+                
+                # Check if there's significant overlap
+                # If last time of 1 is before first time of 2 or vice versa, they don't overlap
+                no_overlap = times1[-1] < times2[0] or times2[-1] < times1[0]
+                
+                # Find the overlap if any
+                overlap_start = max(times1[0], times2[0])
+                overlap_end = min(times1[-1], times2[-1])
+                overlap_duration = max(0, overlap_end - overlap_start)
+                
+                # Calculate total durations
+                duration1 = times1[-1] - times1[0]
+                duration2 = times2[-1] - times2[0]
+                
+                # Allow merging if no overlap or very small overlap
+                can_merge_time = no_overlap or overlap_duration < 0.2 * min(duration1, duration2)
+                
+                if not can_merge_time:
+                    continue
                     
-                    # Check if we've reached our target
-                    if merged_count >= to_merge:
-                        break
+                # Compare features if both have feature representations
+                if id1 in self.feature_database and id2 in self.feature_database:
+                    feature_sim = 1 - cosine(self.feature_database[id1].flatten(),
+                                          self.feature_database[id2].flatten())
+                    
+                    # Merge if similarity is high enough
+                    if feature_sim > threshold:
+                        merged_ids.add(id2)
+                        id_mappings[id2] = id1
+                        logger.debug(f"Merging identity {id2} into {id1}, similarity: {feature_sim:.4f}")
         
         if merged_ids:
             logger.info(f"Merging {len(merged_ids)} identities in Camera 1")
@@ -475,7 +445,7 @@ class GlobalTracker:
                     del self.feature_database[old_id]
             
             new_count = len(camera1_global_ids) - len(merged_ids)
-            logger.info(f"Camera 1 identities reduced from {len(camera1_global_ids)} to {new_count}")
+            logger.info(f"Camera 1 identities: merged {len(merged_ids)} similar identities based on visual features")
 
 class PersonTracker:
     """
@@ -499,8 +469,16 @@ class PersonTracker:
         self.output_dir = os.path.join(output_dir, self.video_name)
         os.makedirs(self.output_dir, exist_ok=True)
         
+        # Check for CUDA availability
+        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.info("CUDA not available, using CPU")
+        
         # Initialize models
-        self.detector = YOLO("yolo11x.pt")  # Fix: correct model name
+        self.detector = YOLO("yolo11x.pt")  # YOLO model
+        self.detector.to(self.device)  # Move model to GPU
         self.reid_model = self._initialize_reid_model()
         
         # Initialize video capture
@@ -1148,9 +1126,7 @@ class PersonTracker:
                     if self.filter_detection(bbox, conf):
                         detections.append((bbox, conf))
         
-        # Limit detections for Camera 1 to reduce over-counting
-        if self.camera_id == 1 and len(detections) > 7:  # Increased from 6 to detect more in Camera 1
-            detections = sorted(detections, key=lambda x: x[1], reverse=True)[:7]
+        # Process all detections without artificial limiting
         
         # Process detections
         matched_tracks = set()
@@ -1427,7 +1403,7 @@ def process_video_directory(input_dir, output_dir=None):
             import traceback
             logger.error(traceback.format_exc())
     
-    # Apply special post-processing to merge identities in Camera 1
+    # Merge similar identities in Camera 1 based on feature similarity
     if len(global_tracker.camera1_tracks) > 0:
         global_tracker.merge_similar_identities_in_camera1()
     
@@ -1474,15 +1450,10 @@ def process_video_directory(input_dir, output_dir=None):
 def main():
     """Main function to run the video tracking and analysis."""
     # Working directory with videos
-    working_dir = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
-                             'Documents', 'VISIONARY', 'Durham Experiment', 'Experiment Data',
-                             'CG1')
+    working_dir = '/home/mchen/Projects/VISIONARY/videos/test_data'
     
-    # Create output in a subfolder named after the directory 
-    input_dir_name = os.path.basename(os.path.normpath(working_dir))
-    result_dir = os.path.join('C:\\Users', 'mc1159', 'OneDrive - University of Exeter',
-                             'Documents', 'VISIONARY', 'Durham Experiment', 'Results')
-    output_dir = os.path.join(result_dir, f"{input_dir_name}_results")
+    # Create output directory
+    output_dir = '/home/mchen/Projects/VISIONARY/results/'
     
     # Process the videos
     results = process_video_directory(working_dir, output_dir)
