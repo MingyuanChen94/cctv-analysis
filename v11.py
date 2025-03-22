@@ -46,10 +46,17 @@ class GlobalTracker:
         # Stores color histograms for each identity
         self.color_features = {}
         
-        # Parameters for cross-camera matching
-        self.min_transition_time = 15       # Reduced from 22 to capture more transitions
-        self.max_transition_time = 900      # Maximum time (15 minutes)
-        self.cross_camera_threshold = 0.70  # Reduced from 0.75 to allow more matches
+        # Parameters for cross-camera matching (OPTIMIZED)
+        self.min_transition_time = 10        # Minimum transition time
+        self.max_transition_time = 600       # Maximum time (10 minutes)
+        self.cross_camera_threshold = 0.65   # Optimized threshold
+        self.feature_similarity_min = 0.743  # Minimum feature similarity
+        self.color_sim_weight = 0.181        # Weight for color similarity
+        self.feature_sim_weight = 0.636      # Weight for feature similarity
+        self.time_factor_weight = 0.133      # Weight for time factor
+        self.door_interaction_bonus = 0.102  # Bonus for door interaction
+        self.optimal_transit_time = 120      # Optimal transit time
+        self.feature_update_alpha = 0.7      # Feature update alpha
         
         # Track door interactions
         self.door_exits = defaultdict(list)    # Tracks exiting through doors
@@ -57,7 +64,7 @@ class GlobalTracker:
         
         # Stores feature history for each identity
         self.feature_history = defaultdict(list)
-        self.max_features_history = 5
+        self.max_features_history = 3       # Optimized value
         
         # Camera-specific track sets
         self.camera1_tracks = set()
@@ -154,11 +161,10 @@ class GlobalTracker:
             
             # Update feature database with new sample
             if global_id in self.feature_database:
-                # Use weighted average with moderate weight
-                alpha = 0.6
+                # Use weighted average with optimized weight
                 self.feature_database[global_id] = (
-                    alpha * self.feature_database[global_id] + 
-                    (1 - alpha) * features
+                    self.feature_update_alpha * self.feature_database[global_id] + 
+                    (1 - self.feature_update_alpha) * features
                 )
             
             return global_id
@@ -189,8 +195,8 @@ class GlobalTracker:
             # Calculate feature similarity - core matching metric
             feature_sim = 1 - cosine(features.flatten(), stored_features.flatten())
             
-            # Skip if feature similarity is below threshold
-            if feature_sim < 0.65:  # Reduced from 0.68 to allow more matches
+            # Skip if feature similarity is below minimum threshold
+            if feature_sim < self.feature_similarity_min:
                 continue
             
             # For Camera 1 to Camera 2 transitions, check door interactions
@@ -206,21 +212,21 @@ class GlobalTracker:
                 # Add bonus for door exit from Camera 1 or entry into Camera 2
                 if camera1_keys and camera1_keys[0] in self.door_exits:
                     door_validation = True
-                    transition_bonus = 0.08  # Reduced to be more conservative
+                    transition_bonus = self.door_interaction_bonus / 2
                 if camera_key in self.door_entries:
                     door_validation = True
-                    transition_bonus = 0.08  # Reduced to be more conservative
+                    transition_bonus = self.door_interaction_bonus / 2
                 
-                # If both door exit and entry are detected, add extra bonus
+                # If both door exit and entry are detected, add full bonus
                 if camera1_keys and camera1_keys[0] in self.door_exits and camera_key in self.door_entries:
-                    transition_bonus = 0.12  # Reduced to be more conservative
+                    transition_bonus = self.door_interaction_bonus
                     
                 # Require door validation for long transition times
                 if time_diff > 180 and not door_validation:  # For transitions longer than 3 minutes
                     continue
                     
                 # Make even stricter for very long transitions (over 5 minutes)
-                if time_diff > 300 and feature_sim < 0.75:
+                if time_diff > 300 and feature_sim < 0.8:
                     continue
             
             # Calculate color similarity if available
@@ -235,18 +241,18 @@ class GlobalTracker:
             
             # Calculate time-based factor for transition time assessment
             if time_diff <= 180:  # For transitions up to 3 minutes
-                optimal_transit = 90  # 1.5 minutes is a typical walking transition time
-                max_deviation = 90    # Allow reasonable deviation
-                time_factor = max(0, 1.0 - abs(time_diff - optimal_transit) / max_deviation)
-            else:  # For longer transitions (3-15 minutes)
+                # Use optimal_transit_time parameter with normalized deviation
+                max_deviation = 120
+                time_factor = max(0, 1.0 - abs(time_diff - self.optimal_transit_time) / max_deviation)
+            else:  # For longer transitions
                 # Exponential decay factor for longer times
                 time_factor = max(0, 0.4 * np.exp(-0.005 * (time_diff - 180)))
             
-            # Combined similarity score with balanced weights
-            similarity = (0.68 * feature_sim +  # Primary factor is feature similarity
-                          0.15 * color_sim +    # Color provides additional evidence
-                          0.07 * time_factor +  # Time provides context
-                          transition_bonus)     # Door interactions provide strong evidence
+            # Combined similarity score with optimized weights
+            similarity = (self.feature_sim_weight * feature_sim +
+                          self.color_sim_weight * color_sim +
+                          self.time_factor_weight * time_factor +
+                          transition_bonus)
             
             # Apply threshold for cross-camera matching 
             if similarity > self.cross_camera_threshold and similarity > best_match_score:
@@ -265,10 +271,9 @@ class GlobalTracker:
                 self.feature_history[best_match_id].pop(0)
                 
             # Update stored features with exponential moving average
-            alpha = 0.6
             self.feature_database[best_match_id] = (
-                alpha * self.feature_database[best_match_id] + 
-                (1 - alpha) * features
+                self.feature_update_alpha * self.feature_database[best_match_id] + 
+                (1 - self.feature_update_alpha) * features
             )
         
         # Register the global identity for this camera-specific track
@@ -301,8 +306,9 @@ class GlobalTracker:
                         # For stricter validation, especially for longer transits:
                         is_door_valid = (current.get('is_exit', False) or next_app.get('is_entry', False))
                         
-                        # Stricter criteria for transit times - prefer shorter transits
-                        is_optimal_time = 30 <= time_diff <= 180  # Slightly easier compared to before (40)
+                        # Use optimal_transit_time parameter for evaluation
+                        # A transition is considered optimal if it's within 90 seconds of the optimal time
+                        is_optimal_time = abs(time_diff - self.optimal_transit_time) <= 90
                         
                         # Additional criteria for long transitions
                         if time_diff > 180:
@@ -311,7 +317,7 @@ class GlobalTracker:
                                 continue
                                 
                             # For very long transitions, be extremely selective
-                            if time_diff > 300 and len(valid_transitions) >= 2:  # Increased from 1
+                            if time_diff > 300 and len(valid_transitions) >= 2:
                                 continue
                         
                         # Prioritize door validation AND optimal timing
@@ -330,7 +336,7 @@ class GlobalTracker:
         # Sort transitions by quality
         if len(valid_transitions) > 0:
             # Sort by score descending, then by transit time ascending (prefer higher scores & shorter times)
-            valid_transitions.sort(key=lambda x: (-x['score'], x['transit_time']))
+            valid_transitions.sort(key=lambda x: (-x['score'], abs(x['transit_time'] - self.optimal_transit_time)))
 
         # Keep the transitions that have higher scores
         valid_transitions = valid_transitions[:2]  # Focus on top 2 transitions
@@ -380,7 +386,7 @@ class GlobalTracker:
         logger.info(f"Camera 1 has {len(sorted_ids)} identities before merging")
                 
         # Simple threshold-based merging without target count
-        threshold = 0.63  # Reduced from 0.67 to merge fewer identities
+        threshold = self.feature_similarity_min - 0.1  # Lower than cross-camera matching
         logger.info(f"Merging similar Camera 1 identities with threshold {threshold}")
         
         # For each pair of identities, check if they should be merged
@@ -421,7 +427,7 @@ class GlobalTracker:
                 duration2 = times2[-1] - times2[0]
                 
                 # Allow merging if no overlap or very small overlap
-                can_merge_time = no_overlap or overlap_duration < 0.18 * min(duration1, duration2)  # Reduced from 0.2
+                can_merge_time = no_overlap or overlap_duration < 0.18 * min(duration1, duration2)
                 
                 if not can_merge_time:
                     continue
@@ -483,16 +489,21 @@ class PersonTracker:
         # Store output directory reference without creating it
         self.output_dir = os.path.join(output_dir, self.video_name)
         
-        # Check for CUDA availability
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        # Check for hardware acceleration
+        self.device = 'cpu'
         if torch.cuda.is_available():
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            self.device = 'cuda:0'
+            logger.info(f"Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+        # Check for Apple Silicon
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = 'mps'
+            logger.info("Using Apple Silicon MPS")
         else:
-            logger.info("CUDA not available, using CPU")
+            logger.info("Hardware acceleration not available, using CPU")
         
         # Initialize models
         self.detector = YOLO("yolo11x.pt")  # YOLO model
-        self.detector.to(self.device)  # Move model to GPU
+        self.detector.to(self.device)  # Move model to device
         self.reid_model = self._initialize_reid_model()
         
         # Initialize video capture
@@ -513,6 +524,44 @@ class PersonTracker:
         self.track_positions = defaultdict(list)  # Position history
         self.next_id = 0  # Next track ID
         
+        # Set camera-specific parameters - OPTIMIZED VALUES
+        if self.camera_id == 1:  # Café environment (Camera 1)
+            # Optimized parameters for Camera 1
+            self.detection_threshold = 0.293
+            self.matching_threshold = 0.6
+            self.merge_threshold = 0.7
+            self.min_track_duration = 0.994
+            self.min_detections = 3
+            self.max_disappeared = 30  # 5 seconds at 6fps
+            self.feature_weight = 1 - 0.291  # = 0.709
+            self.position_weight = 0.291     # iou_weight
+            self.max_lost_age = self.fps * 10
+            self.edge_margin = 8
+            self.door_buffer = 100
+            self.feature_history_size = 10
+            self.feature_update_alpha = 0.703
+            self.color_histogram_bins = 24
+            self.contrast_alpha = 1.196
+            self.brightness_beta = 10
+        else:  # Food shop environment (Camera 2)
+            # Optimized parameters for Camera 2
+            self.detection_threshold = 0.472
+            self.matching_threshold = 0.65
+            self.merge_threshold = 0.55
+            self.min_track_duration = 1.279
+            self.min_detections = 3
+            self.max_disappeared = 30
+            self.feature_weight = 1 - 0.4  # = 0.6
+            self.position_weight = 0.4     # iou_weight
+            self.max_lost_age = self.fps * 10
+            self.edge_margin = 10
+            self.door_buffer = 80
+            self.feature_history_size = 12
+            self.feature_update_alpha = 0.691
+            self.color_histogram_bins = 24
+            self.contrast_alpha = 1.0
+            self.brightness_beta = 0
+        
         # Door regions specific to each camera
         self.door_regions = {
             1: [(1030, 0), (1700, 560)],  # Camera 1 door
@@ -523,36 +572,8 @@ class PersonTracker:
         self.door_entries = set()  # Tracks that entered through door
         self.door_exits = set()    # Tracks that exited through door
         
-        # Set camera-specific tracking parameters
-        if self.camera_id == 1:  # Café environment - adjusted for higher counts
-            # Parameters optimized for complex environment
-            self.detection_threshold = 0.35  # Reduced from 0.42 to detect more people
-            self.matching_threshold = 0.55  # Reduced from 0.58 to make fewer matches between frames
-            self.feature_weight = 0.7
-            self.position_weight = 0.3
-            self.max_disappeared = self.fps * 2  # Reduced from 3 to 2 seconds - create new tracks faster
-            self.max_lost_age = self.fps * 10    # Reduced from 20 to 10 seconds - expire tracks faster
-            self.merge_threshold = 0.65  # Increased from 0.59 to merge fewer tracks (stricter merging)
-        else:  # Food shop environment - adjusted for lower count
-            # Parameters optimized for simpler environment
-            self.detection_threshold = 0.45
-            self.matching_threshold = 0.60  # Increased from 0.58 to make matching stricter
-            self.feature_weight = 0.65
-            self.position_weight = 0.35
-            self.max_disappeared = self.fps * 3
-            self.max_lost_age = self.fps * 15
-            self.merge_threshold = 0.62  # Increased from 0.57 to merge fewer tracks
-            
-        # Track quality thresholds
-        if self.camera_id == 1:
-            self.min_track_duration = 1.2  # Reduced from 1.6 to keep more tracks as valid
-            self.min_detections = 3        # Reduced from 4 to keep more tracks as valid
-        else:
-            self.min_track_duration = 1.6  # Slightly reduced from 1.7
-            self.min_detections = 4
-        
         # Track consolidation parameters
-        self.consolidation_frequency = 20 if self.camera_id == 1 else 25  # Reduced frequency for Camera 1
+        self.consolidation_frequency = 20
         
         logger.info("Initialized tracker for %s", video_path)
         logger.info("Detection threshold: %.2f, Matching threshold: %.2f",
@@ -573,9 +594,8 @@ class PersonTracker:
         model.classifier = torch.nn.Identity()  # Remove classifier for feature extraction
         model.eval()
         
-        # Move to GPU if available
-        if torch.cuda.is_available():
-            model = model.cuda()
+        # Move to appropriate device
+        model = model.to(self.device)
             
         return model
 
@@ -593,7 +613,14 @@ class PersonTracker:
             if person_crop.size == 0 or person_crop.shape[0] < 20 or person_crop.shape[1] < 20:
                 return None
             
-            # Basic preprocessing without too much enhancement
+            # Apply image enhancement with camera-specific parameters
+            if self.camera_id == 1 and (self.contrast_alpha != 1.0 or self.brightness_beta != 0):
+                # Apply contrast and brightness adjustment
+                person_crop = cv2.convertScaleAbs(person_crop, 
+                                                alpha=self.contrast_alpha, 
+                                                beta=self.brightness_beta)
+            
+            # Basic preprocessing
             img = cv2.resize(person_crop, (128, 256))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
@@ -606,8 +633,8 @@ class PersonTracker:
             std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
             img = (img - mean) / std
             
-            if torch.cuda.is_available():
-                img = img.cuda()
+            # Move to appropriate device
+            img = img.to(self.device)
                 
             # Extract features
             with torch.no_grad():
@@ -635,10 +662,10 @@ class PersonTracker:
             # Convert to HSV for better color representation
             hsv = cv2.cvtColor(person_crop, cv2.COLOR_BGR2HSV)
             
-            # Calculate histograms for each channel - using standard bins
-            hist_h = cv2.calcHist([hsv], [0], None, [16], [0, 180])
-            hist_s = cv2.calcHist([hsv], [1], None, [16], [0, 256])
-            hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256])
+            # Calculate histograms for each channel with optimized bins
+            hist_h = cv2.calcHist([hsv], [0], None, [self.color_histogram_bins], [0, 180])
+            hist_s = cv2.calcHist([hsv], [1], None, [self.color_histogram_bins], [0, 256])
+            hist_v = cv2.calcHist([hsv], [2], None, [self.color_histogram_bins], [0, 256])
             
             # Normalize histograms
             hist_h = cv2.normalize(hist_h, hist_h).flatten()
@@ -667,7 +694,8 @@ class PersonTracker:
         x_min, y_min = door[0]
         x_max, y_max = door[1]
         
-        buffer = 60 if self.camera_id == 1 else 50  # Increased buffer for Camera 1
+        # Use optimized door buffer
+        buffer = self.door_buffer  # Camera-specific buffer
         
         return (x_min - buffer <= center_x <= x_max + buffer and 
                 y_min - buffer <= center_y <= y_max + buffer)
@@ -682,15 +710,14 @@ class PersonTracker:
         Returns:
             Tuple of (is_entering, is_exiting) booleans
         """
-        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 4:  # Reduced from 5
+        if track_id not in self.track_positions or len(self.track_positions[track_id]) < 4:
             return False, False
             
         # Get first few and last few positions
         first_positions = self.track_positions[track_id][:3]  # First 3 positions
         last_positions = self.track_positions[track_id][-3:]  # Last 3 positions
         
-        # Standard check for entry/exit - more lenient for Camera 1
-        min_door_count = 1 if self.camera_id == 1 else 2  # Reduced from 2 for Camera 1
+        min_door_count = 1 if self.camera_id == 1 else 2
         
         is_entering = sum(1 for pos in first_positions if self.is_in_door_region(pos)) >= min_door_count
         is_exiting = sum(1 for pos in last_positions if self.is_in_door_region(pos)) >= min_door_count
@@ -729,7 +756,7 @@ class PersonTracker:
             # Calculate position similarity (IOU)
             position_sim = self.calculate_iou(detection_box, track_info['box'])
             
-            # Combined similarity - balanced weights
+            # Combined similarity with optimized weights
             similarity = (self.feature_weight * feature_sim + 
                          self.position_weight * position_sim)
             
@@ -766,7 +793,7 @@ class PersonTracker:
                 similarity = (0.7 * feature_sim + 0.2 * position_sim + 0.1 * time_factor)
                 
                 # Camera-specific recover thresholds
-                recover_threshold = self.matching_threshold - (0.05 if self.camera_id == 1 else 0.06)
+                recover_threshold = self.matching_threshold - 0.05
                 if similarity > recover_threshold and similarity > best_match_score:
                     best_match_id = track_id
                     best_match_score = similarity
@@ -798,17 +825,16 @@ class PersonTracker:
             'disappeared': 0
         })
         
-        # Update feature history
+        # Update feature history with camera-specific history size
         self.feature_history[track_id].append(features)
-        if len(self.feature_history[track_id]) > 10:  # Standard history length
+        if len(self.feature_history[track_id]) > self.feature_history_size:
             self.feature_history[track_id].pop(0)
             
-        # Update feature representation with exponential moving average
+        # Update feature representation with camera-specific EMA weight
         if track_id in self.person_features:
-            alpha = 0.7  # Standard EMA weight
             self.person_features[track_id] = (
-                alpha * self.person_features[track_id] + 
-                (1 - alpha) * features
+                self.feature_update_alpha * self.person_features[track_id] + 
+                (1 - self.feature_update_alpha) * features
             )
         else:
             self.person_features[track_id] = features
@@ -852,22 +878,12 @@ class PersonTracker:
         Returns:
             New track ID or None if creation failed
         """
-        # Camera-specific edge filtering
-        if self.camera_id == 1:
-            edge_margin = 10  # Decreased from 16 to detect more people at edges
-            if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
-                bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
-                # Only allow door region detections at edges
-                if not self.is_in_door_region(bbox):
-                    return None
-        else:
-            # Slightly stricter edge filtering for Camera 2 to detect fewer people
-            edge_margin = 12  # Increased from 10
-            if (bbox[0] < edge_margin or bbox[2] > self.frame_width - edge_margin or 
-                bbox[1] < edge_margin or bbox[3] > self.frame_height - edge_margin):
-                # Make exception for door regions
-                if not self.is_in_door_region(bbox):
-                    return None
+        # Camera-specific edge filtering with optimized margins
+        if (bbox[0] < self.edge_margin or bbox[2] > self.frame_width - self.edge_margin or 
+            bbox[1] < self.edge_margin or bbox[3] > self.frame_height - self.edge_margin):
+            # Only allow door region detections at edges
+            if not self.is_in_door_region(bbox):
+                return None
         
         # Create the new track
         track_id = self.next_id
@@ -895,7 +911,7 @@ class PersonTracker:
         return track_id
 
     def consolidate_tracks(self):
-        """Merge tracks that likely belong to the same person - fine-tuned for each camera"""
+        """Merge tracks that likely belong to the same person with camera-specific thresholds"""
         merged_tracks = set()
         
         # Sort tracks by first appearance time for consistent merging
@@ -927,8 +943,8 @@ class PersonTracker:
                     track1_duration = time1_end - time1_start
                     track2_duration = time2_end - time2_start
                     
-                    # Camera-specific overlap threshold
-                    max_overlap = 0.4 if self.camera_id == 1 else 0.25  # Reduced for Camera 1 from 0.5
+                    # Allow limited overlap for same-camera tracks
+                    max_overlap = 0.18
                     
                     if overlap_duration > max_overlap * min(track1_duration, track2_duration):
                         continue
@@ -943,11 +959,9 @@ class PersonTracker:
                         hist_sim = 1 - cosine(feat1.flatten(), feat2.flatten())
                         feature_sim = max(feature_sim, 0.9 * hist_sim)  # Slightly discount historical matches
                 
-                # Camera-specific feature threshold - adjusted for target counts
-                feature_threshold = 0.60 if self.camera_id == 1 else 0.58  # Increased for Camera 1
-                
-                # If feature similarity isn't high enough, skip
-                if feature_sim < feature_threshold:
+                # Use camera-specific merge thresholds for feature matching
+                min_feature_sim = 0.6 if self.camera_id == 1 else 0.55
+                if feature_sim < min_feature_sim:
                     continue
                 
                 # Calculate color similarity
@@ -974,7 +988,7 @@ class PersonTracker:
                 # Combined similarity score - balanced weights
                 combined_sim = 0.65 * feature_sim + 0.2 * color_sim + 0.15 * pos_sim
                 
-                # Apply camera-specific merging threshold
+                # Apply camera-specific merging threshold (from optimization)
                 if combined_sim > self.merge_threshold:
                     logger.debug(f"Merging tracks {track_id2} into {track_id1}, similarity: {combined_sim:.4f}")
                     self.merge_tracks(track_id1, track_id2)
@@ -1000,9 +1014,9 @@ class PersonTracker:
         # Combine feature histories
         if track_id2 in self.feature_history:
             self.feature_history[track_id1].extend(self.feature_history[track_id2])
-            # Keep most recent features
-            if len(self.feature_history[track_id1]) > 10:
-                self.feature_history[track_id1] = self.feature_history[track_id1][-10:]
+            # Keep most recent features based on camera-specific history size
+            if len(self.feature_history[track_id1]) > self.feature_history_size:
+                self.feature_history[track_id1] = self.feature_history[track_id1][-self.feature_history_size:]
         
         # Combine position histories
         if track_id2 in self.track_positions:
@@ -1043,7 +1057,7 @@ class PersonTracker:
             if track_id not in matched_tracks:
                 self.active_tracks[track_id]['disappeared'] += 1
                 
-                # Move to lost tracks if disappeared for too long
+                # Move to lost tracks if disappeared for too long (optimized)
                 if self.active_tracks[track_id]['disappeared'] > self.max_disappeared:
                     self.lost_tracks[track_id] = self.active_tracks[track_id]
                     del self.active_tracks[track_id]
@@ -1068,10 +1082,9 @@ class PersonTracker:
         width = x2 - x1
         height = y2 - y1
         
-        # Size checks - fine-tuned for each camera
-        # Size requirements based on typical human proportions
+        # Size checks with camera-specific thresholds
         if self.camera_id == 1:
-            if width < 25 or height < 45:  # Reduced from 28/50 to detect more people
+            if width < 25 or height < 45:
                 return False
         else:
             if width < 28 or height < 48:
@@ -1079,34 +1092,24 @@ class PersonTracker:
             
         # Check aspect ratio (typical human aspect ratio)
         aspect_ratio = height / width
-        if aspect_ratio < 1.2 or aspect_ratio > 3.6:  # Widened range from 1.3-3.5
+        if aspect_ratio < 1.2 or aspect_ratio > 3.6:
             return False
             
         # Filter out detections with too large or too small areas
         area = width * height
         # Area thresholds based on typical human sizes
-        min_area = 1500 if self.camera_id == 1 else 1850  # Reduced for Camera 1
-        max_area = 0.3 * self.frame_width * self.frame_height  # Increased from 0.25
+        min_area = 1500 if self.camera_id == 1 else 1850
+        max_area = 0.3 * self.frame_width * self.frame_height
         
         if area < min_area or area > max_area:
             return False
             
-        # Camera-specific checks
-        if self.camera_id == 1:
-            # For café (Camera 1)
-            edge_margin = 10  # Decreased to detect more
-            if x1 < edge_margin or x2 > self.frame_width - edge_margin:
-                # Allow if in door region
-                if self.is_in_door_region(bbox):
-                    return True
-                return False
-        else:
-            # For food shop (Camera 2)
-            if y1 < 10:  # Slightly increased to detect fewer
-                # Allow if in door region
-                if self.is_in_door_region(bbox):
-                    return True
-                return False
+        # Camera-specific edge checks with optimized margins
+        if x1 < self.edge_margin or x2 > self.frame_width - self.edge_margin:
+            # Allow if in door region
+            if self.is_in_door_region(bbox):
+                return True
+            return False
         
         return True
 
@@ -1122,7 +1125,7 @@ class PersonTracker:
         Returns:
             Processed frame with visualization
         """
-        # Run consolidation periodically - more frequent for Camera 1
+        # Run consolidation periodically
         if frame_count % self.consolidation_frequency == 0 and frame_count > 0:
             merged = self.consolidate_tracks()
             if merged > 0:
@@ -1142,8 +1145,6 @@ class PersonTracker:
                     if self.filter_detection(bbox, conf):
                         detections.append((bbox, conf))
         
-        # Process all detections without artificial limiting
-        
         # Process detections
         matched_tracks = set()
         
@@ -1151,8 +1152,8 @@ class PersonTracker:
             x1, y1, x2, y2 = bbox
             
             # Skip if box is too small - camera-specific
-            min_width = 25 if self.camera_id == 1 else 24  # Reduced for Camera 1
-            min_height = 45 if self.camera_id == 1 else 40  # Reduced for Camera 1
+            min_width = 25 if self.camera_id == 1 else 28
+            min_height = 45 if self.camera_id == 1 else 48
             
             if (x2 - x1) < min_width or (y2 - y1) < min_height:
                 continue
@@ -1217,20 +1218,20 @@ class PersonTracker:
         
         return frame
 
-    def process_video(self, visualize=True):
+    def process_video(self, visualize=False):
         """
         Process the entire video and track persons.
         
         Args:
-            visualize: Whether to show visualization
+            visualize: Whether to show visualization (default: False)
             
         Returns:
             Dictionary of valid tracks
         """
         frame_count = 0
         
-        # Camera-specific frame sampling
-        stride = 1  # Process all frames to potentially detect more people
+        # Process all frames
+        stride = 1
         
         logger.info("Starting video processing: %s", self.video_name)
         start_time = time.time()
@@ -1263,8 +1264,8 @@ class PersonTracker:
         logger.info("Completed processing %s in %.2f seconds", 
                    self.video_name, process_time)
         
-        # Perform final track consolidation - camera-specific number of passes
-        consolidation_rounds = 2 if self.camera_id == 1 else 2  # Reduced from 3 for Camera 1
+        # Perform final track consolidation - 2 rounds
+        consolidation_rounds = 2
         for i in range(consolidation_rounds):
             merged = self.consolidate_tracks()
             logger.info("Final consolidation round %d: merged %d tracks", 
@@ -1444,6 +1445,11 @@ def process_video_directory(input_dir, output_dir=None):
         if len(global_tracker.camera1_tracks) > 0:
             global_tracker.merge_similar_identities_in_camera1(target_count=25)  # Target approximately 25 individuals
         
+        # Apply camera-specific optimizations before analysis
+        # Merge similar identities in Camera 1 based on feature similarity
+        if len(global_tracker.camera1_tracks) > 0:
+            global_tracker.merge_similar_identities_in_camera1(target_count=25)
+        
         # Analyze camera transitions
         transition_analysis = global_tracker.analyze_camera_transitions()
         
@@ -1500,14 +1506,19 @@ def process_video_directory(input_dir, output_dir=None):
 
 def main():
     """Main function to run the video tracking and analysis."""
-    # Working directory with videos
-    working_dir = '/home/mchen/Projects/VISIONARY/videos/test_data'
+    import argparse
     
-    # Create output directory
-    output_dir = '/home/mchen/Projects/VISIONARY/results/'
+    parser = argparse.ArgumentParser(description='Multi-camera person tracking and transition analysis')
+    parser.add_argument('--input_dir', type=str, default='/home/mchen/Projects/VISIONARY/videos/test_data', 
+                        help='Directory containing camera videos')
+    parser.add_argument('--output_dir', type=str, default='/home/mchen/Projects/VISIONARY/results/', 
+                        help='Directory to store results')
+    parser.add_argument('--visualize', action='store_true', help='Enable visualization during processing')
+    
+    args = parser.parse_args()
     
     # Process the videos
-    results = process_video_directory(working_dir, output_dir)
+    results = process_video_directory(args.input_dir, args.output_dir)
     
     if results:
         # Print summary
@@ -1516,7 +1527,9 @@ def main():
         print(f"Camera 2 Unique Individuals: {results['unique_camera2']}")
         print(f"Camera 1 to Camera 2 Transitions: {results['transitions']['camera1_to_camera2']}")
         print("============================\n")
-        print(f"Results saved to: {output_dir}")
+        print(f"Results saved to: {args.output_dir}")
+    else:
+        print("No results generated. Please check your input directory and logs.")
 
 if __name__ == "__main__":
     main()
