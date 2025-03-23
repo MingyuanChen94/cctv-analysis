@@ -1109,72 +1109,72 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         
         results1 = tracker1.process_video(visualize=visualize)
         
-    # Register detections with global tracker
-    for person_id, person_data in results1['persons'].items():
-        # Load features from the correct path
-        features_path = person_data['features_path']
-        
-        # Check if file exists before loading
-        if not os.path.exists(features_path):
-            print(f"Features file not found for Camera 1, person {person_id}: {features_path}")
+        # Register detections with global tracker
+        for person_id, person_data in results1['persons'].items():
+            # Load features from the correct path
+            features_path = person_data['features_path']
             
-            # Try to generate features from stored person images
-            person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
-                                   "person_images", f"person_{person_id}")
-            if os.path.exists(person_dir):
-                image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
-                if image_files:
-                    # Use the most recent image to generate features
-                    img_path = os.path.join(person_dir, image_files[-1])
-                    try:
-                        print(f"Attempting to regenerate features from image: {img_path}")
-                        img = cv2.imread(img_path)
-                        if img is not None:
-                            img = cv2.resize(img, (128, 256))
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
-                            img = img.astype(np.float32) / 255.0
-                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
-                            img = img.to(device)
-                            
-                            with torch.no_grad():
-                                features = reid_model(img)
-                                features = features.cpu().numpy()
+            # Check if file exists before loading
+            if not os.path.exists(features_path):
+                print(f"Features file not found for Camera 1, person {person_id}: {features_path}")
+                
+                # Try to generate features from stored person images
+                person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
+                                       "person_images", f"person_{person_id}")
+                if os.path.exists(person_dir):
+                    image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
+                    if image_files:
+                        # Use the most recent image to generate features
+                        img_path = os.path.join(person_dir, image_files[-1])
+                        try:
+                            print(f"Attempting to regenerate features from image: {img_path}")
+                            img = cv2.imread(img_path)
+                            if img is not None:
+                                img = cv2.resize(img, (128, 256))
+                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+                                img = img.astype(np.float32) / 255.0
+                                img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
+                                img = img.to(device)
                                 
-                            # Save regenerated features
-                            os.makedirs(os.path.dirname(features_path), exist_ok=True)
-                            np.savez_compressed(features_path, 
-                                               features=features,
-                                               timestamp=person_data['first_appearance'],
-                                               video_name=tracker1.video_name)
-                            print(f"Successfully regenerated and saved features for person {person_id}")
-                            
-                            global_tracker.register_camera_detection(
-                                camera_id=CAMERA1_ID,
-                                person_id=person_id,
-                                features=features,
-                                timestamp=person_data['first_appearance']
-                            )
-                            continue
-                    except Exception as e:
-                        print(f"Error regenerating features: {e}")
-            
-            # Skip if couldn't regenerate
-            continue
-            
-        try:
-            features_data = np.load(features_path)
-            features = features_data['features']
-            timestamp = person_data['first_appearance']
-            
-            global_tracker.register_camera_detection(
-                camera_id=CAMERA1_ID,
-                person_id=person_id,
-                features=features,
-                timestamp=timestamp
-            )
-        except Exception as e:
-            print(f"Error loading features for Camera 1, person {person_id}: {e}")
-            continue
+                                with torch.no_grad():
+                                    features = reid_model(img)
+                                    features = features.cpu().numpy()
+                                    
+                                # Save regenerated features
+                                os.makedirs(os.path.dirname(features_path), exist_ok=True)
+                                np.savez_compressed(features_path, 
+                                                   features=features,
+                                                   timestamp=person_data['first_appearance'],
+                                                   video_name=tracker1.video_name)
+                                print(f"Successfully regenerated and saved features for person {person_id}")
+                                
+                                global_tracker.register_camera_detection(
+                                    camera_id=CAMERA1_ID,
+                                    person_id=person_id,
+                                    features=features,
+                                    timestamp=person_data['first_appearance']
+                                )
+                                continue
+                        except Exception as e:
+                            print(f"Error regenerating features: {e}")
+                
+                # Skip if couldn't regenerate
+                continue
+                
+            try:
+                features_data = np.load(features_path)
+                features = features_data['features']
+                timestamp = person_data['first_appearance']
+                
+                global_tracker.register_camera_detection(
+                    camera_id=CAMERA1_ID,
+                    person_id=person_id,
+                    features=features,
+                    timestamp=timestamp
+                )
+            except Exception as e:
+                print(f"Error loading features for Camera 1, person {person_id}: {e}")
+                continue
             
     except Exception as e:
         print(f"Error processing Camera 1 video: {e}")
@@ -1197,73 +1197,73 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         
         results2 = tracker2.process_video(visualize=visualize)
         
-    # Register detections with global tracker
-    for person_id, person_data in results2['persons'].items():
-        # Load features from the correct path
-        features_path = person_data['features_path']
-        
-        # Check if file exists before loading
-        if not os.path.exists(features_path):
-            print(f"Features file not found for Camera 2, person {person_id}: {features_path}")
+        # Register detections with global tracker
+        for person_id, person_data in results2['persons'].items():
+            # Load features from the correct path
+            features_path = person_data['features_path']
             
-            # Try to generate features from stored person images
-            person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
-                                   "person_images", f"person_{person_id}")
-            if os.path.exists(person_dir):
-                image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
-                if image_files:
-                    # Use the most recent image to generate features
-                    img_path = os.path.join(person_dir, image_files[-1])
-                    try:
-                        print(f"Attempting to regenerate features from image: {img_path}")
-                        img = cv2.imread(img_path)
-                        if img is not None:
-                            img = cv2.resize(img, (128, 256))
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
-                            img = img.astype(np.float32) / 255.0
-                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
-                            img = img.to(device)
-                            
-                            with torch.no_grad():
-                                features = reid_model(img)
-                                features = features.cpu().numpy()
+            # Check if file exists before loading
+            if not os.path.exists(features_path):
+                print(f"Features file not found for Camera 2, person {person_id}: {features_path}")
+                
+                # Try to generate features from stored person images
+                person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
+                                       "person_images", f"person_{person_id}")
+                if os.path.exists(person_dir):
+                    image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
+                    if image_files:
+                        # Use the most recent image to generate features
+                        img_path = os.path.join(person_dir, image_files[-1])
+                        try:
+                            print(f"Attempting to regenerate features from image: {img_path}")
+                            img = cv2.imread(img_path)
+                            if img is not None:
+                                img = cv2.resize(img, (128, 256))
+                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+                                img = img.astype(np.float32) / 255.0
+                                img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
+                                img = img.to(device)
                                 
-                            # Save regenerated features
-                            os.makedirs(os.path.dirname(features_path), exist_ok=True)
-                            np.savez_compressed(features_path, 
-                                               features=features,
-                                               timestamp=person_data['first_appearance'],
-                                               video_name=tracker2.video_name)
-                            print(f"Successfully regenerated and saved features for person {person_id}")
-                            
-                            global_tracker.register_camera_detection(
-                                camera_id=CAMERA2_ID,
-                                person_id=person_id,
-                                features=features,
-                                timestamp=person_data['first_appearance']
-                            )
-                            continue
-                    except Exception as e:
-                        print(f"Error regenerating features: {e}")
-            
-            # Skip if couldn't regenerate
-            continue
-            
-        try:
-            features_data = np.load(features_path)
-            features = features_data['features']
-            timestamp = person_data['first_appearance']
-            
-            global_tracker.register_camera_detection(
-                camera_id=CAMERA2_ID,
-                person_id=person_id,
-                features=features,
-                timestamp=timestamp
-            )
-        except Exception as e:
-            print(f"Error loading features for Camera 2, person {person_id}: {e}")
-            continue
-            
+                                with torch.no_grad():
+                                    features = reid_model(img)
+                                    features = features.cpu().numpy()
+                                    
+                                # Save regenerated features
+                                os.makedirs(os.path.dirname(features_path), exist_ok=True)
+                                np.savez_compressed(features_path, 
+                                                   features=features,
+                                                   timestamp=person_data['first_appearance'],
+                                                   video_name=tracker2.video_name)
+                                print(f"Successfully regenerated and saved features for person {person_id}")
+                                
+                                global_tracker.register_camera_detection(
+                                    camera_id=CAMERA2_ID,
+                                    person_id=person_id,
+                                    features=features,
+                                    timestamp=person_data['first_appearance']
+                                )
+                                continue
+                        except Exception as e:
+                            print(f"Error regenerating features: {e}")
+                
+                # Skip if couldn't regenerate
+                continue
+                
+            try:
+                features_data = np.load(features_path)
+                features = features_data['features']
+                timestamp = person_data['first_appearance']
+                
+                global_tracker.register_camera_detection(
+                    camera_id=CAMERA2_ID,
+                    person_id=person_id,
+                    features=features,
+                    timestamp=timestamp
+                )
+            except Exception as e:
+                print(f"Error loading features for Camera 2, person {person_id}: {e}")
+                continue
+                
     except Exception as e:
         print(f"Error processing Camera 2 video: {e}")
         import traceback
