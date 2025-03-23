@@ -27,6 +27,27 @@ TARGET_TRANSITIONS = 2
 # Script to be optimized
 SCRIPT_PATH = "v15.py"  # Adjust if necessary
 
+# Helper function to convert NumPy values to Python native types
+def convert_numpy_types(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder for NumPy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
 class BayesianOptimizer:
     """Bayesian optimization for parameter tuning of people tracking script."""
     
@@ -107,11 +128,11 @@ class BayesianOptimizer:
         Returns:
             float: Error metric (distance from target values)
         """
-        # Create a config dictionary from the parameters
-        config = {name: value for name, value in params.items()}
+        # Create a config dictionary from the parameters and convert NumPy types
+        config = {name: convert_numpy_types(value) for name, value in params.items()}
         
         # Add some fixed parameters (these could be moved to optimization space if needed)
-        config.update({
+        fixed_config = {
             'cam1_motion_weight': 0.1,
             'cam1_part_weight': 0.1,
             'cam1_pose_weight': 0.1,
@@ -133,32 +154,38 @@ class BayesianOptimizer:
             'temporal_constraint': True,
             'max_time_gap': 60,
             'min_time_gap': 2,
-            
-            # Camera topology information
-            'camera_topology': {
-                "1": {
-                    "2": {
-                        'direction': 'right_to_left',
-                        'avg_transit_time': (config['cam1_to_cam2_min_time'] + config['cam1_to_cam2_max_time']) // 2,
-                        'exit_zones': [[0.7, 0.3, 1.0, 0.8]],
-                        'entry_zones': [[0.0, 0.3, 0.3, 0.8]]
-                    }
-                },
+        }
+        config.update(fixed_config)
+        
+        # Calculate transit time for topology
+        min_time = config['cam1_to_cam2_min_time']
+        max_time = config['cam1_to_cam2_max_time']
+        avg_time = int((min_time + max_time) // 2)
+        
+        # Add camera topology
+        config['camera_topology'] = {
+            "1": {
                 "2": {
-                    "1": {
-                        'direction': 'left_to_right',
-                        'avg_transit_time': 15,
-                        'exit_zones': [[0.0, 0.3, 0.3, 0.8]],
-                        'entry_zones': [[0.7, 0.3, 1.0, 0.8]]
-                    }
+                    'direction': 'right_to_left',
+                    'avg_transit_time': avg_time,
+                    'exit_zones': [[0.7, 0.3, 1.0, 0.8]],
+                    'entry_zones': [[0.0, 0.3, 0.3, 0.8]]
+                }
+            },
+            "2": {
+                "1": {
+                    'direction': 'left_to_right',
+                    'avg_transit_time': 15,
+                    'exit_zones': [[0.0, 0.3, 0.3, 0.8]],
+                    'entry_zones': [[0.7, 0.3, 1.0, 0.8]]
                 }
             }
-        })
+        }
         
         # Save config to a temporary file
         config_path = Path(self.output_dir) / 'temp_config.json'
         with open(config_path, 'w') as f:
-            json.dump(config, f)
+            json.dump(config, f, cls=NumpyEncoder)
         
         # Run the tracking script with the current configuration
         trial_dir = Path(self.output_dir) / f'trial_{int(time.time())}'
@@ -175,7 +202,7 @@ class BayesianOptimizer:
             
             # Run the script and capture output
             if self.verbose:
-                print(f"Running trial with parameters: {params}")
+                print(f"Running trial with parameters: {config}")
             
             result = subprocess.run(cmd, capture_output=True, text=True)
             
@@ -201,25 +228,25 @@ class BayesianOptimizer:
                 10 * ((transitions - TARGET_TRANSITIONS) / max(1, TARGET_TRANSITIONS)) ** 2
             )
             
-            # Store trial results
+            # Store trial results with converted params
             trial_result = {
-                'params': params,
+                'params': {k: convert_numpy_types(v) for k, v in params.items()},
                 'result': result_tuple,
-                'error': mse
+                'error': float(mse)
             }
             self.opt_history.append(trial_result)
             
             # Update best result if needed
             if mse < self.best_score:
-                self.best_score = mse
-                self.best_params = params
+                self.best_score = float(mse)
+                self.best_params = {k: convert_numpy_types(v) for k, v in params.items()}
                 self.best_result = result_tuple
                 self.save_best_params()
                 
                 if self.verbose:
                     print(f"New best: {result_tuple}, Error: {mse:.4f}")
             
-            return mse
+            return float(mse)
             
         except Exception as e:
             print(f"Error running script: {e}")
@@ -235,13 +262,13 @@ class BayesianOptimizer:
             'target': (TARGET_CAMERA1, TARGET_CAMERA2, TARGET_TRANSITIONS)
         }
         with open(best_params_path, 'w') as f:
-            json.dump(result_info, f, indent=4)
+            json.dump(result_info, f, cls=NumpyEncoder)
     
     def save_optimization_history(self):
         """Save the full optimization history."""
         history_path = Path(self.output_dir) / 'optimization_history.json'
         with open(history_path, 'w') as f:
-            json.dump(self.opt_history, f, indent=4)
+            json.dump(self.opt_history, f, cls=NumpyEncoder)
     
     def optimize(self):
         """Run the Bayesian optimization."""
@@ -277,7 +304,7 @@ class BayesianOptimizer:
             print(f"Optimization completed in {end_time - start_time:.2f} seconds")
             print(f"Best parameters found:")
             for name, value in zip(self.param_names, result.x):
-                print(f"  {name}: {value}")
+                print(f"  {name}: {convert_numpy_types(value)}")
             print(f"Best result: {self.best_result}")
             print(f"Error: {self.best_score:.4f}")
         
@@ -308,35 +335,36 @@ class BayesianOptimizer:
         results = np.array([trial['result'] for trial in self.opt_history])
         
         # Plot counts over iterations
-        plt.plot(iterations, results[:, 0], 'b-', label='Camera 1')
-        plt.plot(iterations, results[:, 1], 'g-', label='Camera 2')
-        plt.plot(iterations, results[:, 2], 'r-', label='Transitions')
-        
-        # Add target lines
-        plt.axhline(y=TARGET_CAMERA1, color='b', linestyle='--', label=f'Target Camera 1: {TARGET_CAMERA1}')
-        plt.axhline(y=TARGET_CAMERA2, color='g', linestyle='--', label=f'Target Camera 2: {TARGET_CAMERA2}')
-        plt.axhline(y=TARGET_TRANSITIONS, color='r', linestyle='--', label=f'Target Transitions: {TARGET_TRANSITIONS}')
-        
-        plt.xlabel('Iteration')
-        plt.ylabel('Count')
-        plt.title('Count Results Over Iterations')
-        plt.legend()
-        plt.grid(True)
-        
-        # Plot error over iterations
-        plt.subplot(212)
-        errors = [trial['error'] for trial in self.opt_history]
-        plt.plot(iterations, errors, 'k-')
-        plt.xlabel('Iteration')
-        plt.ylabel('Error')
-        plt.title('Error Over Iterations')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(plots_dir / 'progress.png')
-        
-        if self.verbose:
-            print(f"Plots saved to {plots_dir}")
+        if len(results) > 0:
+            plt.plot(iterations, results[:, 0], 'b-', label='Camera 1')
+            plt.plot(iterations, results[:, 1], 'g-', label='Camera 2')
+            plt.plot(iterations, results[:, 2], 'r-', label='Transitions')
+            
+            # Add target lines
+            plt.axhline(y=TARGET_CAMERA1, color='b', linestyle='--', label=f'Target Camera 1: {TARGET_CAMERA1}')
+            plt.axhline(y=TARGET_CAMERA2, color='g', linestyle='--', label=f'Target Camera 2: {TARGET_CAMERA2}')
+            plt.axhline(y=TARGET_TRANSITIONS, color='r', linestyle='--', label=f'Target Transitions: {TARGET_TRANSITIONS}')
+            
+            plt.xlabel('Iteration')
+            plt.ylabel('Count')
+            plt.title('Count Results Over Iterations')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot error over iterations
+            plt.subplot(212)
+            errors = [trial['error'] for trial in self.opt_history]
+            plt.plot(iterations, errors, 'k-')
+            plt.xlabel('Iteration')
+            plt.ylabel('Error')
+            plt.title('Error Over Iterations')
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(plots_dir / 'progress.png')
+            
+            if self.verbose:
+                print(f"Plots saved to {plots_dir}")
 
 
 def setup_argparse():
