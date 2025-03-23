@@ -1828,111 +1828,231 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         )
         
         results1 = tracker1.process_video(visualize=visualize)
+    except Exception as e:
+        print(f"Error processing Camera 1 video: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    print("\n===== Processing Camera 2 =====")
+    # Process Camera 2 video
+    try:
+        tracker2 = PersonTracker(
+            video_path=video2_path,
+            output_dir=output_dir,
+            detector=detector,
+            reid_model=reid_model,
+            device=device,
+            camera_id=CAMERA2_ID,
+            config=config
+        )
         
-        # Register detections with global tracker
-        for person_id, person_data in results1['persons'].items():
-            # Load features from the correct path
-            features_path = person_data['features_path']
-            
-            # Check if file exists before loading
-            if not os.path.exists(features_path):
-                print(f"Features file not found for Camera 1, person {person_id}: {features_path}")
-                
-                # Try to generate features from stored person images
-                person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
-                                       "person_images", f"person_{person_id}")
-                if os.path.exists(person_dir):
-                    image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
-                    if image_files:
-                        # Use the most recent image to generate features
-                        img_path = os.path.join(person_dir, image_files[-1])
-                        try:
-                            print(f"Attempting to regenerate features from image: {img_path}")
-                            img = cv2.imread(img_path)
-                            if img is not None:
-                                # Extract color histogram
-                                color_extractor = ColorHistogramExtractor(bins=32)
-                                color_features = color_extractor.extract(img)
-                                
-                                # Preprocess for ReID
-                                img = cv2.resize(img, (128, 256))
-                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
-                                img = img.astype(np.float32) / 255.0
-                                img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
-                                img = img.to(device)
-                                
-                                with torch.no_grad():
-                                    features = reid_model(img)
-                                    features = F.normalize(features, p=2, dim=1).cpu().numpy()
-                                    
-                                # Save regenerated features
-                                os.makedirs(os.path.dirname(features_path), exist_ok=True)
-                                np.savez_compressed(features_path, 
-                                                   features=features,
-                                                   timestamp=person_data['first_appearance'],
-                                                   video_name=tracker2.video_name,
-                                                   confirmations=person_data.get('confirmations', 0))
-                                print(f"Successfully regenerated and saved features for person {person_id}")
-                                
-                                # Check for entry zone
-                                is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
-                                    [0, 0, img.shape[2], img.shape[1]],  # Use full image as a fallback
-                                    tracker2.frame_width, 
-                                    tracker2.frame_height
-                                )
-                                
-                                global_tracker.register_camera_detection(
-                                    camera_id=CAMERA2_ID,
-                                    person_id=person_id,
-                                    features=features,
-                                    color_features=color_features,
-                                    timestamp=person_data['first_appearance'],
-                                    confirmations=person_data.get('confirmations', 0),
-                                    is_exit_zone=is_in_entry_zone
-                                )
-                                continue
-                        except Exception as e:
-                            print(f"Error regenerating features: {e}")
-                
-                # Skip if couldn't regenerate
-                continue
-                
-            try:
-                features_data = np.load(features_path)
-                features = features_data['features']
-                timestamp = person_data['first_appearance']
-                confirmations = features_data.get('confirmations', person_data.get('confirmations', 0))
-                
-                # Check if this detection is in an entry zone (for better cross-camera matching)
-                is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
-                    tracker2.active_tracks.get(int(person_id), {}).get('box', [0, 0, 0, 0]),
-                    tracker2.frame_width, 
-                    tracker2.frame_height
-                )
-                
-                # Create dummy color features if not available
-                color_features = None
-                if person_id in tracker2.person_color_features:
-                    color_features = tracker2.person_color_features[person_id]
-                
-                global_tracker.register_camera_detection(
-                    camera_id=CAMERA2_ID,
-                    person_id=person_id,
-                    features=features,
-                    color_features=color_features,
-                    timestamp=timestamp,
-                    confirmations=confirmations,
-                    is_exit_zone=is_in_entry_zone
-                )
-            except Exception as e:
-                print(f"Error loading features for Camera 2, person {person_id}: {e}")
-                continue
-                
+        results2 = tracker2.process_video(visualize=visualize)
     except Exception as e:
         print(f"Error processing Camera 2 video: {e}")
         import traceback
         traceback.print_exc()
         return None
+    
+    print("\n===== Registering Camera 1 detections with global tracker =====")
+    # Register Camera 1 detections with global tracker
+    for person_id, person_data in results1['persons'].items():
+        # Load features from the correct path
+        features_path = person_data['features_path']
+        
+        # Check if file exists before loading
+        if not os.path.exists(features_path):
+            print(f"Features file not found for Camera 1, person {person_id}: {features_path}")
+            
+            # Try to generate features from stored person images
+            person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
+                                   "person_images", f"person_{person_id}")
+            if os.path.exists(person_dir):
+                image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
+                if image_files:
+                    # Use the most recent image to generate features
+                    img_path = os.path.join(person_dir, image_files[-1])
+                    try:
+                        print(f"Attempting to regenerate features from image: {img_path}")
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            # Extract color histogram
+                            color_extractor = ColorHistogramExtractor(bins=32)
+                            color_features = color_extractor.extract(img)
+                            
+                            # Preprocess for ReID
+                            img = cv2.resize(img, (128, 256))
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+                            img = img.astype(np.float32) / 255.0
+                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
+                            img = img.to(device)
+                            
+                            with torch.no_grad():
+                                features = reid_model(img)
+                                features = F.normalize(features, p=2, dim=1).cpu().numpy()
+                                
+                            # Save regenerated features
+                            os.makedirs(os.path.dirname(features_path), exist_ok=True)
+                            np.savez_compressed(features_path, 
+                                               features=features,
+                                               timestamp=person_data['first_appearance'],
+                                               video_name=tracker1.video_name,
+                                               confirmations=person_data.get('confirmations', 0))
+                            print(f"Successfully regenerated and saved features for person {person_id}")
+                            
+                            # Check for exit zone
+                            is_in_exit_zone = tracker1.env_model.is_in_exit_zone(
+                                [0, 0, img.shape[2], img.shape[1]],  # Use full image as a fallback
+                                tracker1.frame_width, 
+                                tracker1.frame_height
+                            )
+                            
+                            global_tracker.register_camera_detection(
+                                camera_id=CAMERA1_ID,
+                                person_id=person_id,
+                                features=features,
+                                color_features=color_features,
+                                timestamp=person_data['first_appearance'],
+                                confirmations=person_data.get('confirmations', 0),
+                                is_exit_zone=is_in_exit_zone
+                            )
+                            continue
+                    except Exception as e:
+                        print(f"Error regenerating features: {e}")
+            
+            # Skip if couldn't regenerate
+            continue
+            
+        try:
+            features_data = np.load(features_path)
+            features = features_data['features']
+            timestamp = person_data['first_appearance']
+            confirmations = features_data.get('confirmations', person_data.get('confirmations', 0))
+            
+            # Check if this detection is in an exit zone (for better cross-camera matching)
+            is_in_exit_zone = tracker1.env_model.is_in_exit_zone(
+                tracker1.active_tracks.get(int(person_id), {}).get('box', [0, 0, 0, 0]),
+                tracker1.frame_width, 
+                tracker1.frame_height
+            )
+            
+            # Create dummy color features if not available
+            color_features = None
+            if person_id in tracker1.person_color_features:
+                color_features = tracker1.person_color_features[person_id]
+            
+            global_tracker.register_camera_detection(
+                camera_id=CAMERA1_ID,
+                person_id=person_id,
+                features=features,
+                color_features=color_features,
+                timestamp=timestamp,
+                confirmations=confirmations,
+                is_exit_zone=is_in_exit_zone
+            )
+        except Exception as e:
+            print(f"Error loading features for Camera 1, person {person_id}: {e}")
+            continue
+    
+    print("\n===== Registering Camera 2 detections with global tracker =====")
+    # Register Camera 2 detections with global tracker
+    for person_id, person_data in results2['persons'].items():
+        # Load features from the correct path
+        features_path = person_data['features_path']
+        
+        # Check if file exists before loading
+        if not os.path.exists(features_path):
+            print(f"Features file not found for Camera 2, person {person_id}: {features_path}")
+            
+            # Try to generate features from stored person images
+            person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
+                                   "person_images", f"person_{person_id}")
+            if os.path.exists(person_dir):
+                image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
+                if image_files:
+                    # Use the most recent image to generate features
+                    img_path = os.path.join(person_dir, image_files[-1])
+                    try:
+                        print(f"Attempting to regenerate features from image: {img_path}")
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            # Extract color histogram
+                            color_extractor = ColorHistogramExtractor(bins=32)
+                            color_features = color_extractor.extract(img)
+                            
+                            # Preprocess for ReID
+                            img = cv2.resize(img, (128, 256))
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+                            img = img.astype(np.float32) / 255.0
+                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
+                            img = img.to(device)
+                            
+                            with torch.no_grad():
+                                features = reid_model(img)
+                                features = F.normalize(features, p=2, dim=1).cpu().numpy()
+                                
+                            # Save regenerated features
+                            os.makedirs(os.path.dirname(features_path), exist_ok=True)
+                            np.savez_compressed(features_path, 
+                                               features=features,
+                                               timestamp=person_data['first_appearance'],
+                                               video_name=tracker2.video_name,
+                                               confirmations=person_data.get('confirmations', 0))
+                            print(f"Successfully regenerated and saved features for person {person_id}")
+                            
+                            # Check for entry zone
+                            is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
+                                [0, 0, img.shape[2], img.shape[1]],  # Use full image as a fallback
+                                tracker2.frame_width, 
+                                tracker2.frame_height
+                            )
+                            
+                            global_tracker.register_camera_detection(
+                                camera_id=CAMERA2_ID,
+                                person_id=person_id,
+                                features=features,
+                                color_features=color_features,
+                                timestamp=person_data['first_appearance'],
+                                confirmations=person_data.get('confirmations', 0),
+                                is_exit_zone=is_in_entry_zone
+                            )
+                            continue
+                    except Exception as e:
+                        print(f"Error regenerating features: {e}")
+            
+            # Skip if couldn't regenerate
+            continue
+            
+        try:
+            features_data = np.load(features_path)
+            features = features_data['features']
+            timestamp = person_data['first_appearance']
+            confirmations = features_data.get('confirmations', person_data.get('confirmations', 0))
+            
+            # Check if this detection is in an entry zone (for better cross-camera matching)
+            is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
+                tracker2.active_tracks.get(int(person_id), {}).get('box', [0, 0, 0, 0]),
+                tracker2.frame_width, 
+                tracker2.frame_height
+            )
+            
+            # Create dummy color features if not available
+            color_features = None
+            if person_id in tracker2.person_color_features:
+                color_features = tracker2.person_color_features[person_id]
+            
+            global_tracker.register_camera_detection(
+                camera_id=CAMERA2_ID,
+                person_id=person_id,
+                features=features,
+                color_features=color_features,
+                timestamp=timestamp,
+                confirmations=confirmations,
+                is_exit_zone=is_in_entry_zone
+            )
+        except Exception as e:
+            print(f"Error loading features for Camera 2, person {person_id}: {e}")
+            continue
     
     # Analyze transitions with enhanced accuracy
     print("\n===== Analyzing Cross-Camera Transitions =====")
