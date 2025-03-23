@@ -2425,7 +2425,7 @@ class EnhancedParameterOptimizer:
         
         return None
 
-def process_video_directory(input_dir, output_dir=None, params=None, target_camera1=None):
+def process_video_directory(input_dir, output_dir=None, params=None):
     """
     Process all videos in a directory and generate cross-camera analysis.
     
@@ -2433,22 +2433,10 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_came
         input_dir: Directory containing camera videos
         output_dir: Directory to store results (if None, uses input_dir)
         params: Optional custom parameters to use
-        target_camera1: Optional target count for Camera 1 individuals
         
     Returns:
         Dictionary containing analysis results
     """
-    if len(global_tracker.camera1_tracks) > 0:
-        camera1_merge_threshold = 0.63  # Start with a default value
-        if params and 'camera1_merge_threshold' in params:
-            camera1_merge_threshold = params['camera1_merge_threshold']
-        elif params:
-            camera_params = {k[8:]: v for k, v in params.items() if k.startswith('camera1_')}
-            if 'merge_threshold' in camera_params:
-                camera1_merge_threshold = camera_params['merge_threshold']
-        
-        global_tracker.merge_similar_identities_in_camera1(threshold=camera1_merge_threshold)
-        
     # If no output directory specified, use the input directory
     if output_dir is None:
         output_dir = input_dir
@@ -2492,26 +2480,11 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_came
         logger.info(f"Processing videos for date: {date}")
         
         # Create global tracker for this date with custom parameters if provided
-        if params:
-            # Extract global tracker parameters
-            global_tracker_params = {k: v for k, v in params.items() 
-                                  if not k.startswith('camera1_') and not k.startswith('camera2_')}
-            
-            cross_camera_threshold = global_tracker_params.get('cross_camera_threshold', 0.70)
-            min_transition_time = global_tracker_params.get('min_transition_time', 15)
-            feature_sim_weight = global_tracker_params.get('feature_sim_weight', 0.68)
-            color_sim_weight = global_tracker_params.get('color_sim_weight', 0.15)
-            time_factor_weight = global_tracker_params.get('time_factor_weight', 0.07)
-            door_interaction_bonus = global_tracker_params.get('door_interaction_bonus', 0.12)
-            
+        if params and 'cross_camera_threshold' in params and 'min_transition_time' in params:
             global_tracker = GlobalTracker(
                 date=date,
-                cross_camera_threshold=cross_camera_threshold,
-                min_transition_time=min_transition_time,
-                feature_sim_weight=feature_sim_weight,
-                color_sim_weight=color_sim_weight,
-                time_factor_weight=time_factor_weight,
-                door_interaction_bonus=door_interaction_bonus
+                cross_camera_threshold=params['cross_camera_threshold'],
+                min_transition_time=params['min_transition_time']
             )
         else:
             global_tracker = GlobalTracker(date=date)
@@ -2527,48 +2500,26 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_came
                 
                 # Initialize tracker with custom parameters if provided
                 if params:
-                    if camera_id == 1:
-                        # Extract Camera 1 parameters with proper prefixes
-                        camera_params = {k[8:]: v for k, v in params.items() if k.startswith('camera1_')}
-                        
+                    if camera_id == 1 and 'camera1_detection_threshold' in params:
                         tracker = PersonTracker(
                             str(video_path), 
                             output_dir,
-                            detection_threshold=camera_params.get('detection_threshold'),
-                            matching_threshold=camera_params.get('matching_threshold'),
-                            merge_threshold=camera_params.get('merge_threshold'),
-                            min_track_duration=camera_params.get('min_track_duration'),
-                            min_detections=camera_params.get('min_detections'),
-                            max_disappeared=camera_params.get('max_disappeared'),
-                            iou_weight=camera_params.get('iou_weight'),
-                            edge_margin=camera_params.get('edge_margin'),
-                            door_buffer=camera_params.get('door_buffer'),
-                            feature_history_size=camera_params.get('feature_history_size'),
-                            feature_update_alpha=camera_params.get('feature_update_alpha'),
-                            color_histogram_bins=camera_params.get('color_histogram_bins'),
-                            contrast_alpha=camera_params.get('contrast_alpha'),
-                            brightness_beta=camera_params.get('brightness_beta')
+                            detection_threshold=params.get('camera1_detection_threshold'),
+                            matching_threshold=params.get('camera1_matching_threshold'),
+                            merge_threshold=params.get('camera1_merge_threshold'),
+                            min_track_duration=params.get('camera1_min_track_duration'),
+                            min_detections=params.get('camera1_min_detections')
+                        )
+                    elif camera_id == 2 and 'camera2_detection_threshold' in params:
+                        tracker = PersonTracker(
+                            str(video_path), 
+                            output_dir,
+                            detection_threshold=params.get('camera2_detection_threshold'),
+                            matching_threshold=params.get('camera2_matching_threshold'),
+                            merge_threshold=params.get('camera2_merge_threshold')
                         )
                     else:
-                        # Extract Camera 2 parameters with proper prefixes
-                        camera_params = {k[8:]: v for k, v in params.items() if k.startswith('camera2_')}
-                        
-                        tracker = PersonTracker(
-                            str(video_path), 
-                            output_dir,
-                            detection_threshold=camera_params.get('detection_threshold'),
-                            matching_threshold=camera_params.get('matching_threshold'),
-                            merge_threshold=camera_params.get('merge_threshold'),
-                            min_track_duration=camera_params.get('min_track_duration'),
-                            min_detections=camera_params.get('min_detections'),
-                            max_disappeared=camera_params.get('max_disappeared'),
-                            iou_weight=camera_params.get('iou_weight'),
-                            edge_margin=camera_params.get('edge_margin'),
-                            door_buffer=camera_params.get('door_buffer'),
-                            feature_history_size=camera_params.get('feature_history_size'),
-                            feature_update_alpha=camera_params.get('feature_update_alpha'),
-                            color_histogram_bins=camera_params.get('color_histogram_bins')
-                        )
+                        tracker = PersonTracker(str(video_path), output_dir)
                 else:
                     tracker = PersonTracker(str(video_path), output_dir)
                 
@@ -2604,47 +2555,13 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_came
                 import traceback
                 logger.error(traceback.format_exc())
         
-        # If a target Camera 1 count is provided, try to adjust merging to match it
-        if target_camera1 is not None:
-            # Get current Camera 1 count
-            camera1_tracks = [key for key in global_tracker.camera1_tracks if key in global_tracker.global_identities]
-            current_camera1_count = len(set(global_tracker.global_identities[key] for key in camera1_tracks)) if camera1_tracks else 0
-            
-            logger.info(f"Pre-adjustment Camera 1 count: {current_camera1_count}, target: {target_camera1}")
-            
-            if current_camera1_count > target_camera1:
-                # Try more aggressive merging to reduce count
-                merge_threshold = 0.55 if params is None else params.get('camera1_merge_threshold', 0.55)
-                
-                # Calculate how many merges we need
-                target_merges = current_camera1_count - target_camera1
-                logger.info(f"Attempting to merge {target_merges} identities to reach target of {target_camera1}")
-                
-                # Adjust threshold to be more aggressive
-                adjusted_threshold = max(0.45, merge_threshold - 0.05)
-                global_tracker.merge_similar_identities_in_camera1(
-                    threshold=adjusted_threshold, 
-                    max_merges=target_merges
-                )
-            elif current_camera1_count < target_camera1:
-                # We have too few identities - don't try to merge
-                logger.info(f"Camera 1 count {current_camera1_count} is less than target {target_camera1}, skipping merging")
+        # Now we're guaranteed to have a valid global_tracker for this date
+        # Merge similar identities in Camera 1 based on feature similarity
+        if hasattr(global_tracker, 'camera1_tracks') and len(global_tracker.camera1_tracks) > 0:
+            if params and 'camera1_merge_threshold' in params:
+                global_tracker.merge_similar_identities_in_camera1(threshold=params['camera1_merge_threshold'])
             else:
-                # We're already at the target, use normal merging
-                merge_threshold = 0.63 if params is None else params.get('camera1_merge_threshold', 0.63)
-                global_tracker.merge_similar_identities_in_camera1(threshold=merge_threshold)
-        else:
-            # No target specified, use normal merging
-            if len(global_tracker.camera1_tracks) > 0:
-                camera1_merge_threshold = None
-                if params and 'camera1_merge_threshold' in params:
-                    camera1_merge_threshold = params['camera1_merge_threshold']
-                elif params:
-                    camera_params = {k[8:]: v for k, v in params.items() if k.startswith('camera1_')}
-                    if 'merge_threshold' in camera_params:
-                        camera1_merge_threshold = camera_params['merge_threshold']
-                
-                global_tracker.merge_similar_identities_in_camera1(threshold=camera1_merge_threshold)
+                global_tracker.merge_similar_identities_in_camera1()
         
         # Analyze camera transitions
         transition_analysis = global_tracker.analyze_camera_transitions()
@@ -2717,12 +2634,10 @@ def main():
                         help="Target number of unique individuals in Camera 2")
     parser.add_argument("--target-transitions", type=int, default=2,
                         help="Target number of transitions from Camera 1 to Camera 2")
-    parser.add_argument("--iterations", "-n", type=int, default=30,
+    parser.add_argument("--iterations", "-n", type=int, default=20,
                         help="Number of iterations for parameter optimization")
     parser.add_argument("--params-file", "-f", type=str, default=None,
                         help="JSON file with predefined parameters to use")
-    parser.add_argument("--force-target", action="store_true",
-                        help="Force results to match target values using post-processing")
     
     args = parser.parse_args()
     
@@ -2738,30 +2653,25 @@ def main():
         try:
             with open(args.params_file, 'r') as f:
                 params_data = json.load(f)
-                # Check if this is the new organized format or old flat format
-                if 'organized_params' in params_data:
-                    # New format - flatten the organized params
-                    camera1_params = {f'camera1_{k}': v for k, v in params_data['organized_params']['camera1_params'].items()}
-                    camera2_params = {f'camera2_{k}': v for k, v in params_data['organized_params']['camera2_params'].items()}
-                    cross_params = params_data['organized_params']['cross_camera_params']
-                    
-                    predefined_params = {}
-                    predefined_params.update(camera1_params)
-                    predefined_params.update(camera2_params)
-                    predefined_params.update(cross_params)
+                # Try to extract params from different possible locations in the JSON
+                if 'params' in params_data:
+                    predefined_params = params_data['params']
+                elif 'best_params' in params_data:
+                    predefined_params = params_data['best_params']
                 else:
-                    # Old format or just params key
-                    predefined_params = params_data.get('params', params_data)
+                    predefined_params = params_data
                     
                 logger.info(f"Loaded predefined parameters from {args.params_file}")
                 
                 # Process videos with predefined parameters
                 results = process_video_directory(
-                    working_dir, 
-                    output_dir, 
-                    predefined_params,
-                    args.target_camera1 if args.force_target else None
+                    working_dir, output_dir, predefined_params
                 )
+                
+                if results is None:
+                    logger.error("Failed to process videos with predefined parameters, falling back to defaults")
+                    results = process_video_directory(working_dir, output_dir)
+                    
         except Exception as e:
             logger.error(f"Error loading or using predefined parameters: {e}")
             import traceback
@@ -2771,9 +2681,9 @@ def main():
     # Check if we should run parameter optimization
     elif args.optimize:
         try:
-            # Create the enhanced optimizer with target values
+            # Create the optimizer with target values
             target_values = (args.target_camera1, args.target_camera2, args.target_transitions)
-            optimizer = EnhancedParameterOptimizer(
+            optimizer = ParameterOptimizer(
                 target_values=target_values,
                 max_iterations=args.iterations
             )
@@ -2785,18 +2695,9 @@ def main():
             # Print the best configuration
             if best_config:
                 print("\n===== OPTIMIZATION RESULTS =====")
-                print("Camera 1 Parameters:")
-                for param, value in best_config['organized_params']['camera1_params'].items():
+                print(f"Best Parameters:")
+                for param, value in best_config['best_params'].items():
                     print(f"  {param}: {value}")
-                    
-                print("\nCamera 2 Parameters:")
-                for param, value in best_config['organized_params']['camera2_params'].items():
-                    print(f"  {param}: {value}")
-                    
-                print("\nCross-Camera Parameters:")
-                for param, value in best_config['organized_params']['cross_camera_params'].items():
-                    print(f"  {param}: {value}")
-                    
                 print("\nResults with Best Parameters:")
                 print(f"Camera 1 Unique Individuals: {best_config['results']['camera1_count']}")
                 print(f"Camera 2 Unique Individuals: {best_config['results']['camera2_count']}")
@@ -2828,8 +2729,7 @@ def main():
             results = process_video_directory(working_dir, output_dir)
     else:
         # Process the videos with default parameters
-        target_camera1 = args.target_camera1 if args.force_target else None
-        results = process_video_directory(working_dir, output_dir, target_camera1=target_camera1)
+        results = process_video_directory(working_dir, output_dir)
     
     if results:
         # Print summary
