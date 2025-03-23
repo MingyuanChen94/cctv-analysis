@@ -1023,16 +1023,12 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
             'max_time_gap': 600,  # 10 minutes
             'min_time_gap': 1     # 1 second
         }
-        
-    # Create specific output directory using source directory name if provided
-    if source_dir_name:
-        output_dir = os.path.join(output_dir, source_dir_name)
     
     print("\n===== Loading models =====")
     # Load models
     try:
         # Load YOLO model
-        detector = YOLO("yolo12x.pt")
+        detector = YOLO("yolov8s.pt")
         detector.to(device)
         
         # Load ReID model
@@ -1055,7 +1051,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     try:
         tracker1 = PersonTracker(
             video_path=video1_path,
-            output_dir=output_dir,
+            output_dir=output_dir,  # Don't add source_dir_name again
             detector=detector,
             reid_model=reid_model,
             device=device,
@@ -1067,17 +1063,22 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         
         # Register detections with global tracker
         for person_id, person_data in results1['persons'].items():
+            # Load features from the correct path
             features_path = person_data['features_path']
-            features_data = np.load(features_path)
-            features = features_data['features']
-            timestamp = person_data['first_appearance']
-            
-            global_tracker.register_camera_detection(
-                camera_id=CAMERA1_ID,
-                person_id=person_id,
-                features=features,
-                timestamp=timestamp
-            )
+            try:
+                features_data = np.load(features_path)
+                features = features_data['features']
+                timestamp = person_data['first_appearance']
+                
+                global_tracker.register_camera_detection(
+                    camera_id=CAMERA1_ID,
+                    person_id=person_id,
+                    features=features,
+                    timestamp=timestamp
+                )
+            except Exception as e:
+                print(f"Error loading features for Camera 1, person {person_id}: {e}")
+                continue
             
     except Exception as e:
         print(f"Error processing Camera 1 video: {e}")
@@ -1090,7 +1091,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     try:
         tracker2 = PersonTracker(
             video_path=video2_path,
-            output_dir=output_dir,
+            output_dir=output_dir,  # Don't add source_dir_name again
             detector=detector,
             reid_model=reid_model,
             device=device,
@@ -1102,17 +1103,22 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         
         # Register detections with global tracker
         for person_id, person_data in results2['persons'].items():
+            # Load features from the correct path
             features_path = person_data['features_path']
-            features_data = np.load(features_path)
-            features = features_data['features']
-            timestamp = person_data['first_appearance']
-            
-            global_tracker.register_camera_detection(
-                camera_id=CAMERA2_ID,
-                person_id=person_id,
-                features=features,
-                timestamp=timestamp
-            )
+            try:
+                features_data = np.load(features_path)
+                features = features_data['features']
+                timestamp = person_data['first_appearance']
+                
+                global_tracker.register_camera_detection(
+                    camera_id=CAMERA2_ID,
+                    person_id=person_id,
+                    features=features,
+                    timestamp=timestamp
+                )
+            except Exception as e:
+                print(f"Error loading features for Camera 2, person {person_id}: {e}")
+                continue
             
     except Exception as e:
         print(f"Error processing Camera 2 video: {e}")
@@ -1164,12 +1170,9 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
     # Get the input directory name for organizing results
     source_dir_name = input_path.name
     
-    # Create a specific output directory for this input directory
-    source_output_path = output_path / source_dir_name
-    source_output_path.mkdir(parents=True, exist_ok=True)
-    
+    # We'll use source_dir_name only for naming the output files, not for directory structure
     print(f"Processing videos from directory: {source_dir_name}")
-    print(f"Saving results to: {source_output_path}")
+    print(f"Saving results to: {output_path}")
     
     # Get all video files
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
@@ -1206,9 +1209,9 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
         print(f"Camera 1: {video1.name}")
         print(f"Camera 2: {video2.name}")
         
-        # Create pair-specific output directory under the source directory
+        # Create pair-specific output directory
         date_part = video1.stem.split('_')[2]  # Get the YYYYMMDD part
-        pair_output_dir = source_output_path / f"pair_{date_part}"
+        pair_output_dir = output_path / f"pair_{date_part}"
         
         try:
             result = process_video_pair(
@@ -1217,7 +1220,7 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
                 output_dir=str(pair_output_dir),
                 config=config,
                 visualize=visualize,
-                source_dir_name=source_dir_name
+                # Don't pass source_dir_name here
             )
             
             if result:
@@ -1236,8 +1239,8 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
             traceback.print_exc()
             continue
     
-    # Save overall results
-    all_results_path = source_output_path / f"{source_dir_name}_results.json"
+    # Save overall results directly in output_path
+    all_results_path = output_path / f"{source_dir_name}_results.json"
     with open(all_results_path, 'w') as f:
         json.dump(results, f, indent=4)
     
@@ -1255,7 +1258,7 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
             'result_tuple': (result['camera1_count'], result['camera2_count'], result['camera1_to_camera2'])
         })
     
-    summary_path = source_output_path / f"{source_dir_name}_summary.json"
+    summary_path = output_path / f"{source_dir_name}_summary.json"
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=4)
     
@@ -1268,7 +1271,7 @@ def download_models():
     # Check for YOLO
     try:
         # This will download the model if it doesn't exist
-        YOLO("yolo12x.pt")
+        YOLO("yolov8s.pt")
         print("YOLO model is available.")
     except Exception as e:
         print(f"Error checking YOLO model: {e}")
