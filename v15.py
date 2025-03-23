@@ -179,8 +179,9 @@ class PoseExtractor:
             # Import torchvision for KeypointRCNN
             import torchvision
             from torchvision.models.detection import keypointrcnn_resnet50_fpn
+            from torchvision.models.detection.keypoint_rcnn import KeypointRCNN_ResNet50_FPN_Weights
             
-            self.pose_model = keypointrcnn_resnet50_fpn(pretrained=True)
+            self.pose_model = keypointrcnn_resnet50_fpn(weights=KeypointRCNN_ResNet50_FPN_Weights.DEFAULT)
             self.pose_model.to(device)
             self.pose_model.eval()
             self.has_pose_model = True
