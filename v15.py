@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-Camera People Tracker
+Enhanced Cross-Camera People Tracker
 
 Counts unique individuals in Camera 1, Camera 2, and tracks movements between cameras.
 Optimized for NVIDIA RTX-4090 GPUs and Apple Silicon M1 Max.
@@ -22,6 +22,7 @@ from scipy.optimize import linear_sum_assignment
 import scipy.spatial.distance as distance
 from ultralytics import YOLO
 import torchreid
+import torch.nn.functional as F
 
 # Constants
 CAMERA1_ID = "1"
@@ -85,8 +86,174 @@ class TrackingState:
     TENTATIVE = 'tentative'  # New track
     LOST = 'lost'            # Missing too long
 
+class ColorHistogramExtractor:
+    """Extracts color histograms from person crops for improved matching."""
+    
+    def __init__(self, bins=32):
+        self.bins = bins
+        
+    def extract(self, image):
+        """Extract color histogram features from an image."""
+        # Convert to HSV color space (more robust to lighting changes)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Split the image into upper and lower body
+        height = image.shape[0]
+        upper_body = hsv[:height//2, :]
+        lower_body = hsv[height//2:, :]
+        
+        # Calculate histograms for upper and lower body
+        upper_hist = self._compute_histogram(upper_body)
+        lower_hist = self._compute_histogram(lower_body)
+        
+        # Combine histograms
+        combined_hist = np.concatenate([upper_hist, lower_hist])
+        
+        # Normalize
+        combined_hist = combined_hist / (np.sum(combined_hist) + 1e-10)
+        
+        return combined_hist
+    
+    def _compute_histogram(self, image):
+        """Compute color histogram for an image region."""
+        # Calculate histogram for H and S channels (ignore V - brightness)
+        hist = cv2.calcHist([image], [0, 1], None, [self.bins, self.bins], 
+                           [0, 180, 0, 256])
+        # Flatten
+        hist = hist.flatten()
+        return hist
+    
+    def compare(self, hist1, hist2):
+        """Compare two histograms using correlation."""
+        return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+
+class CameraEnvironmentModel:
+    """Models camera-specific environment characteristics for better cross-camera matching."""
+    
+    def __init__(self, camera_id):
+        self.camera_id = camera_id
+        self.is_camera1 = camera_id == CAMERA1_ID
+        
+        # Initialize environment models
+        self.color_distribution = None
+        self.lighting_model = None
+        self.entry_exit_zones = self._init_entry_exit_zones()
+        
+        # Calibration samples
+        self.calibration_frames = []
+        self.max_calibration_frames = 50
+        
+    def _init_entry_exit_zones(self):
+        """Initialize entry/exit zones based on camera ID."""
+        # For Camera 1 (near door)
+        if self.is_camera1:
+            # Define estimated zones where people enter/exit the view
+            # Format: [x_min, y_min, x_max, y_max] as ratio of frame size
+            return {
+                "entry": [0.0, 0.3, 0.2, 0.7],   # Left side of frame
+                "exit": [0.8, 0.3, 1.0, 0.7]     # Right side of frame
+            }
+        # For Camera 2 (food shop)
+        else:
+            return {
+                "entry": [0.8, 0.3, 1.0, 0.7],   # Right side of frame
+                "exit": [0.0, 0.3, 0.2, 0.7]     # Left side of frame
+            }
+    
+    def add_calibration_frame(self, frame):
+        """Add a frame for environment calibration."""
+        if len(self.calibration_frames) < self.max_calibration_frames:
+            self.calibration_frames.append(frame)
+            
+            # Update models if we have enough frames
+            if len(self.calibration_frames) >= 10 and len(self.calibration_frames) % 10 == 0:
+                self._update_environment_model()
+    
+    def _update_environment_model(self):
+        """Update the environment model from calibration frames."""
+        if not self.calibration_frames:
+            return
+        
+        # Calculate average color distribution
+        hsv_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2HSV) for f in self.calibration_frames]
+        avg_h = np.mean([f[:,:,0] for f in hsv_frames], axis=0)
+        avg_s = np.mean([f[:,:,1] for f in hsv_frames], axis=0)
+        avg_v = np.mean([f[:,:,2] for f in hsv_frames], axis=0)
+        
+        # Store color distribution model
+        self.color_distribution = {
+            'h_mean': np.mean(avg_h),
+            'h_std': np.std(avg_h),
+            's_mean': np.mean(avg_s),
+            's_std': np.std(avg_s),
+            'v_mean': np.mean(avg_v),
+            'v_std': np.std(avg_v)
+        }
+        
+        # Create simple lighting model (brightness distribution)
+        self.lighting_model = {
+            'brightness_mean': np.mean(avg_v),
+            'brightness_std': np.std(avg_v)
+        }
+    
+    def is_in_entry_zone(self, box, frame_width, frame_height):
+        """Check if a detection is in the entry zone."""
+        # Convert box to relative coordinates
+        rel_box = [
+            box[0] / frame_width,
+            box[1] / frame_height,
+            box[2] / frame_width,
+            box[3] / frame_height
+        ]
+        
+        # Calculate box center
+        center_x = (rel_box[0] + rel_box[2]) / 2
+        center_y = (rel_box[1] + rel_box[3]) / 2
+        
+        # Get entry zone
+        entry = self.entry_exit_zones["entry"]
+        
+        # Check if center is in entry zone
+        return (entry[0] <= center_x <= entry[2] and
+                entry[1] <= center_y <= entry[3])
+    
+    def is_in_exit_zone(self, box, frame_width, frame_height):
+        """Check if a detection is in the exit zone."""
+        # Convert box to relative coordinates
+        rel_box = [
+            box[0] / frame_width,
+            box[1] / frame_height,
+            box[2] / frame_width,
+            box[3] / frame_height
+        ]
+        
+        # Calculate box center
+        center_x = (rel_box[0] + rel_box[2]) / 2
+        center_y = (rel_box[1] + rel_box[3]) / 2
+        
+        # Get exit zone
+        exit_zone = self.entry_exit_zones["exit"]
+        
+        # Check if center is in exit zone
+        return (exit_zone[0] <= center_x <= exit_zone[2] and
+                exit_zone[1] <= center_y <= exit_zone[3])
+    
+    def normalize_features(self, features, source_camera_id):
+        """Apply camera-specific normalization to features."""
+        # If no color model yet, return original features
+        if self.color_distribution is None or source_camera_id == self.camera_id:
+            return features
+        
+        # Simple feature normalization based on lighting differences
+        if hasattr(features, 'shape'):  # For numpy arrays
+            # We don't modify the deep features directly, just adjust confidence later
+            return features
+        else:
+            # For other feature types, return as is
+            return features
+
 class PersonTracker:
-    """Tracks people within a single video."""
+    """Tracks people within a single video with enhanced re-identification."""
     
     def __init__(self, video_path, output_dir, detector, reid_model, device,
                  camera_id=None, config=None):
@@ -105,7 +272,7 @@ class PersonTracker:
         self.video_path = Path(video_path)
         self.video_name = self.video_path.stem
         # Extract camera ID from the filename - for Camera_1_YYYYMMDD format
-        self.camera_id = self.video_name.split('_')[1] if '_' in self.video_name else None
+        self.camera_id = camera_id or self.video_name.split('_')[1] if '_' in self.video_name else None
         
         # Set up output directories
         self.output_dir = Path(output_dir) / self.video_name
@@ -134,36 +301,62 @@ class PersonTracker:
         self.is_camera1 = self.camera_id == CAMERA1_ID
         self.config = config or {}
         
+        # Initialize camera environment model
+        self.env_model = CameraEnvironmentModel(self.camera_id)
+        
+        # Initialize color histogram extractor
+        self.color_extractor = ColorHistogramExtractor(bins=32)
+        
         # Set tracking parameters based on camera
         if self.is_camera1:  # Camera 1 (more complex environment)
             self.min_detection_confidence = self.config.get('cam1_min_confidence', 0.6)
             self.similarity_threshold = self.config.get('cam1_similarity_threshold', 0.65)
             self.max_disappeared = self.fps * self.config.get('cam1_max_disappear_seconds', 3)
-            self.feature_weight = self.config.get('cam1_feature_weight', 0.6)
-            self.position_weight = self.config.get('cam1_position_weight', 0.2)
-            self.motion_weight = self.config.get('cam1_motion_weight', 0.2)
+            self.feature_weight = self.config.get('cam1_feature_weight', 0.5)
+            self.position_weight = self.config.get('cam1_position_weight', 0.15)
+            self.motion_weight = self.config.get('cam1_motion_weight', 0.15)
+            self.color_weight = self.config.get('cam1_color_weight', 0.2)  # New weight for color features
             self.reentry_threshold = self.config.get('cam1_reentry_threshold', 0.7)
+            self.new_track_confidence = self.config.get('cam1_new_track_confidence', 0.75)
         else:  # Camera 2 (cleaner environment)
             self.min_detection_confidence = self.config.get('cam2_min_confidence', 0.5)
             self.similarity_threshold = self.config.get('cam2_similarity_threshold', 0.7)
             self.max_disappeared = self.fps * self.config.get('cam2_max_disappear_seconds', 2)
-            self.feature_weight = self.config.get('cam2_feature_weight', 0.55)
-            self.position_weight = self.config.get('cam2_position_weight', 0.25)
-            self.motion_weight = self.config.get('cam2_motion_weight', 0.2)
+            self.feature_weight = self.config.get('cam2_feature_weight', 0.45)
+            self.position_weight = self.config.get('cam2_position_weight', 0.2)
+            self.motion_weight = self.config.get('cam2_motion_weight', 0.15)
+            self.color_weight = self.config.get('cam2_color_weight', 0.2)  # New weight for color features
             self.reentry_threshold = self.config.get('cam2_reentry_threshold', 0.75)
+            self.new_track_confidence = self.config.get('cam2_new_track_confidence', 0.8)
+        
+        # Common parameters
+        self.min_track_confirmations = self.config.get('min_track_confirmations', 3)
+        self.min_track_visibility = self.config.get('min_track_visibility', 0.7)
         
         # Initialize tracking variables
         self.active_tracks = {}
         self.lost_tracks = {}
         self.person_features = {}
+        self.person_color_features = {}  # New: store color histogram features
         self.person_timestamps = {}
         self.appearance_history = defaultdict(list)
+        self.color_history = defaultdict(list)  # New: store color history
+        self.appearance_counts = defaultdict(int)  # Track appearance counts
         self.next_id = 0
         
         # Additional tracking parameters
         self.max_lost_age = self.fps * self.config.get('max_lost_seconds', 30)
-        self.max_history_length = self.config.get('max_history_length', 10)
+        self.max_history_length = self.config.get('max_history_length', 20)  # Increased history length
         self.update_interval = self.config.get('process_every_nth_frame', 1)
+        
+        # Cleanup and deduplication
+        self.last_cleanup_frame = 0
+        self.cleanup_interval = self.fps * 10  # Cleanup every 10 seconds
+        self.similarity_cache = {}  # Cache for track similarities
+        
+        # Enhanced tracking features
+        self.track_confirmations = defaultdict(int)  # Count frames for track confirmation
+        self.min_detection_height = self.config.get('min_detection_height', 50)  # Min height for valid detection
         
         print(f"Initialized tracker for {self.video_name} (Camera {self.camera_id})")
         print(f"Video details: {self.frame_width}x{self.frame_height}, {self.fps} FPS, {self.frame_count} frames")
@@ -172,7 +365,7 @@ class PersonTracker:
         """Extract ReID features from person crop."""
         try:
             # Preprocess image for ReID
-            if person_crop.shape[0] < 10 or person_crop.shape[1] < 10:
+            if person_crop.shape[0] < self.min_detection_height or person_crop.shape[1] < 20:
                 return None  # Skip very small detections
                 
             # Make a copy of the crop to ensure contiguous memory
@@ -183,6 +376,9 @@ class PersonTracker:
             
             # Convert BGR to RGB and ensure contiguous array
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+            
+            # Apply color normalization to improve robustness to lighting changes
+            img = self._normalize_colors(img)
             
             # Normalize to [0, 1]
             img = img.astype(np.float32) / 255.0
@@ -197,12 +393,47 @@ class PersonTracker:
             with torch.no_grad():
                 features = self.reid_model(img)
                 
+            # Normalize features for better matching
+            features = F.normalize(features, p=2, dim=1)
+                
             return features.cpu().numpy()
             
         except Exception as e:
             print(f"Error extracting features: {e}")
             import traceback
             traceback.print_exc()
+            return None
+    
+    def _normalize_colors(self, img):
+        """Apply color normalization to improve robustness to lighting changes."""
+        # Use CLAHE for adaptive histogram equalization
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        l = clahe.apply(l)
+        
+        # Merge the CLAHE enhanced L-channel back with A and B channels
+        lab = cv2.merge((l, a, b))
+        
+        # Convert back to RGB
+        normalized_img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        return normalized_img
+    
+    def extract_color_features(self, person_crop):
+        """Extract color histogram features from person crop."""
+        try:
+            if person_crop.shape[0] < 30 or person_crop.shape[1] < 10:
+                return None
+                
+            # Extract color histogram
+            color_hist = self.color_extractor.extract(person_crop)
+            
+            return color_hist
+            
+        except Exception as e:
+            print(f"Error extracting color features: {e}")
             return None
     
     def calculate_box_center(self, box):
@@ -317,8 +548,24 @@ class PersonTracker:
 
         return is_occluded, occlusion_score
     
-    def calculate_similarity_matrix(self, current_features, current_boxes, tracked_features, tracked_boxes):
-        """Calculate similarity matrix combining appearance, position, and motion."""
+    def calculate_color_similarity(self, current_colors, tracked_colors):
+        """Calculate color similarity matrix."""
+        n_detections = len(current_colors)
+        n_tracks = len(tracked_colors)
+        
+        color_sim = np.zeros((n_detections, n_tracks))
+        
+        for i, curr_color in enumerate(current_colors):
+            for j, track_color in enumerate(tracked_colors):
+                # Use histogram correlation
+                similarity = self.color_extractor.compare(curr_color, track_color)
+                color_sim[i, j] = max(0, similarity)  # Ensure non-negative
+                
+        return color_sim
+    
+    def calculate_similarity_matrix(self, current_features, current_boxes, current_colors, 
+                                   tracked_features, tracked_boxes, tracked_colors):
+        """Calculate similarity matrix combining appearance, position, motion, and color."""
         n_detections = len(current_features)
         n_tracks = len(tracked_features)
 
@@ -363,21 +610,32 @@ class PersonTracker:
         # Calculate motion similarity
         motion_sim = self.calculate_motion_similarity(
             current_boxes, tracked_boxes, tracked_velocities)
+            
+        # Calculate color similarity
+        color_sim = self.calculate_color_similarity(current_colors, tracked_colors)
 
         # Combine all similarities with weights
         similarity_matrix = (
             self.feature_weight * appearance_sim +
             self.position_weight * position_sim +
-            self.motion_weight * motion_sim
+            self.motion_weight * motion_sim +
+            self.color_weight * color_sim  # Add color similarity
         )
 
         return similarity_matrix
     
-    def update_feature_history(self, track_id, features):
+    def update_feature_history(self, track_id, features, color_features):
         """Maintain rolling window of recent features."""
+        # Update deep features
         self.appearance_history[track_id].append(features)
         if len(self.appearance_history[track_id]) > self.max_history_length:
             self.appearance_history[track_id].pop(0)
+
+        # Update color features
+        if color_features is not None:
+            self.color_history[track_id].append(color_features)
+            if len(self.color_history[track_id]) > self.max_history_length:
+                self.color_history[track_id].pop(0)
 
         # Update feature representation using exponential moving average
         if track_id in self.person_features:
@@ -385,6 +643,14 @@ class PersonTracker:
             current_features = self.person_features[track_id]
             updated_features = alpha * current_features + (1 - alpha) * features
             self.person_features[track_id] = updated_features
+            
+            # Update color features similarly
+            if track_id in self.person_color_features and color_features is not None:
+                current_color = self.person_color_features[track_id]
+                updated_color = alpha * current_color + (1 - alpha) * color_features
+                self.person_color_features[track_id] = updated_color
+            elif color_features is not None:
+                self.person_color_features[track_id] = color_features
             
             # Save updated features periodically
             if len(self.appearance_history[track_id]) % 5 == 0:  # Save every 5 updates
@@ -395,6 +661,9 @@ class PersonTracker:
                 )
         else:
             self.person_features[track_id] = features
+            if color_features is not None:
+                self.person_color_features[track_id] = color_features
+            
             # Save features immediately for new tracks
             self.save_person_features(
                 track_id, 
@@ -402,8 +671,8 @@ class PersonTracker:
                 self.person_timestamps[track_id]['first_appearance']
             )
     
-    def recover_lost_tracklet(self, features, current_box, frame_time):
-        """Attempt to recover lost tracks."""
+    def recover_lost_tracklet(self, features, color_features, current_box, frame_time):
+        """Attempt to recover lost tracks with enhanced matching."""
         best_match_id = None
         best_match_score = 0
 
@@ -434,11 +703,17 @@ class PersonTracker:
                 lost_info['velocity']
             )
             position_sim = self.calculate_iou(current_box, predicted_box)
+            
+            # Calculate color similarity if available
+            color_sim = 0
+            if color_features is not None and 'color_features' in lost_info and lost_info['color_features'] is not None:
+                color_sim = self.color_extractor.compare(color_features, lost_info['color_features'])
 
             # Combine similarities
             match_score = (
                 self.feature_weight * appearance_sim +
-                self.position_weight * position_sim
+                self.position_weight * position_sim +
+                self.color_weight * max(0, color_sim)  # Ensure non-negative
             )
 
             # Check if this is the best match
@@ -452,12 +727,109 @@ class PersonTracker:
 
         return best_match_id if best_match_score > self.reentry_threshold else None
     
-    def update_existing_track(self, track_id, box, features, frame_time, frame=None):
+    def find_duplicate_active_tracks(self, frame_time):
+        """Find and merge duplicate active tracks."""
+        if len(self.active_tracks) <= 1:
+            return []
+            
+        # Get all active track IDs
+        active_ids = list(self.active_tracks.keys())
+        
+        # Calculate similarity between all pairs of active tracks
+        duplicates_to_merge = []
+        
+        for i in range(len(active_ids)):
+            id1 = active_ids[i]
+            
+            # Skip if recently checked
+            cache_key = f"{id1}_{frame_time//10}"
+            if cache_key in self.similarity_cache:
+                continue
+                
+            self.similarity_cache[cache_key] = True
+            
+            for j in range(i+1, len(active_ids)):
+                id2 = active_ids[j]
+                
+                # Skip if tracks are far apart in time
+                time_diff = abs(self.active_tracks[id1]['last_seen'] - self.active_tracks[id2]['last_seen'])
+                if time_diff > 2.0:  # More than 2 seconds apart
+                    continue
+                
+                # Calculate appearance similarity
+                feat1 = self.person_features[id1].flatten()
+                feat2 = self.person_features[id2].flatten()
+                
+                appearance_sim = 1 - distance.cosine(feat1, feat2)
+                
+                # Calculate position similarity
+                box1 = self.active_tracks[id1]['box']
+                box2 = self.active_tracks[id2]['box']
+                position_sim = self.calculate_iou(box1, box2)
+                
+                # Calculate color similarity if available
+                color_sim = 0
+                if id1 in self.person_color_features and id2 in self.person_color_features:
+                    color1 = self.person_color_features[id1]
+                    color2 = self.person_color_features[id2]
+                    color_sim = self.color_extractor.compare(color1, color2)
+                
+                # Combine similarities
+                similarity = (
+                    self.feature_weight * appearance_sim +
+                    self.position_weight * position_sim +
+                    self.color_weight * max(0, color_sim)
+                )
+                
+                # If similar enough, consider as duplicates
+                if similarity > 0.85:  # Higher threshold for duplicate detection
+                    # Keep the one with more appearances/confirmations
+                    keep_id = id1 if self.appearance_counts[id1] >= self.appearance_counts[id2] else id2
+                    remove_id = id2 if keep_id == id1 else id1
+                    duplicates_to_merge.append((keep_id, remove_id))
+        
+        return duplicates_to_merge
+    
+    def merge_duplicate_tracks(self, duplicates):
+        """Merge duplicate tracks to reduce overcounting."""
+        for keep_id, remove_id in duplicates:
+            if keep_id not in self.active_tracks or remove_id not in self.active_tracks:
+                continue
+                
+            # Update appearance count
+            self.appearance_counts[keep_id] += self.appearance_counts[remove_id]
+            
+            # Update feature history with weighted average
+            keep_count = max(1, len(self.appearance_history[keep_id]))
+            remove_count = max(1, len(self.appearance_history[remove_id]))
+            
+            # Update timestamps to keep the widest time range
+            if remove_id in self.person_timestamps:
+                if self.person_timestamps[remove_id]['first_appearance'] < self.person_timestamps[keep_id]['first_appearance']:
+                    self.person_timestamps[keep_id]['first_appearance'] = self.person_timestamps[remove_id]['first_appearance']
+                
+                if self.person_timestamps[remove_id]['last_appearance'] > self.person_timestamps[keep_id]['last_appearance']:
+                    self.person_timestamps[keep_id]['last_appearance'] = self.person_timestamps[remove_id]['last_appearance']
+            
+            # Remove the duplicate track
+            if remove_id in self.active_tracks:
+                del self.active_tracks[remove_id]
+            
+            # Keep a reference to prevent reassignment
+            self.lost_tracks[remove_id] = {
+                'merged_into': keep_id,
+                'last_seen': self.person_timestamps[keep_id]['last_appearance'] if keep_id in self.person_timestamps else 0
+            }
+            
+            print(f"Merged duplicate tracks: {remove_id} -> {keep_id}")
+    
+    def update_existing_track(self, track_id, box, features, color_features, frame_time, frame=None):
         """Update an existing track with new detection."""
         self.active_tracks[track_id].update({
             'previous_box': self.active_tracks[track_id]['box'],
             'box': box,
             'features': features,
+            'color_features': color_features,
             'last_seen': frame_time,
             'disappeared': 0,
             'state': TrackingState.ACTIVE
@@ -471,8 +843,11 @@ class PersonTracker:
             )
 
         # Update feature history and timestamps
-        self.update_feature_history(track_id, features)
+        self.update_feature_history(track_id, features, color_features)
         self.person_timestamps[track_id]['last_appearance'] = frame_time
+        
+        # Increment appearance count
+        self.appearance_counts[track_id] += 1
         
         # Save person image if frame is provided
         if frame is not None:
@@ -480,16 +855,30 @@ class PersonTracker:
             x1, x2 = max(0, int(box[0])), min(int(box[2]), frame.shape[1])
             if x2 > x1 and y2 > y1:  # Ensure valid crop
                 self.save_person_image(track_id, frame[y1:y2, x1:x2])
+        
+        # Increment track confirmation counter
+        self.track_confirmations[track_id] += 1
     
-    def reactivate_track(self, track_id, box, features, frame_time, frame=None):
+    def reactivate_track(self, track_id, box, features, color_features, frame_time, frame=None):
         """Reactivate a previously lost track."""
         # Get info from lost tracks
         lost_info = self.lost_tracks.pop(track_id)
+        
+        # Check if this track was merged
+        if 'merged_into' in lost_info:
+            # This track was merged, so update the merged track instead
+            merge_target = lost_info['merged_into']
+            if merge_target in self.active_tracks:
+                self.update_existing_track(
+                    merge_target, box, features, color_features, frame_time, frame
+                )
+                return merge_target
         
         # Reactivate in active tracks
         self.active_tracks[track_id] = {
             'box': box,
             'features': features,
+            'color_features': color_features,
             'last_seen': frame_time,
             'disappeared': 0,
             'state': TrackingState.ACTIVE,
@@ -499,7 +888,10 @@ class PersonTracker:
 
         # Update timestamps and feature history
         self.person_timestamps[track_id]['last_appearance'] = frame_time
-        self.update_feature_history(track_id, features)
+        self.update_feature_history(track_id, features, color_features)
+        
+        # Increment appearance count
+        self.appearance_counts[track_id] += 1
         
         # Save person image if frame is provided
         if frame is not None:
@@ -507,24 +899,47 @@ class PersonTracker:
             x1, x2 = max(0, int(box[0])), min(int(box[2]), frame.shape[1])
             if x2 > x1 and y2 > y1:  # Ensure valid crop
                 self.save_person_image(track_id, frame[y1:y2, x1:x2])
+        
+        return track_id
     
-    def create_new_track(self, box, features, frame_time, frame=None):
-        """Create a new track for unmatched detection."""
+    def create_new_track(self, box, features, color_features, frame_time, detection_confidence, frame=None):
+        """Create a new track for unmatched detection with confidence assessment."""
+        # If confidence is too low, make it a tentative track
+        track_state = TrackingState.TENTATIVE
+        
+        # If detection is in entry zone, give higher confidence
+        is_entry = self.env_model.is_in_entry_zone(box, self.frame_width, self.frame_height)
+        if is_entry:
+            detection_confidence *= 1.2  # Boost confidence for entry zone detections
+        
+        # Only create new tracks if confidence is high enough
+        # Skip if detection confidence is too low
+        if detection_confidence < self.new_track_confidence:
+            return None
+            
         new_id = self.next_id
         self.next_id += 1
 
         self.active_tracks[new_id] = {
-            'state': TrackingState.TENTATIVE,
+            'state': track_state,
             'box': box,
             'features': features,
+            'color_features': color_features,
             'last_seen': frame_time,
             'disappeared': 0,
-            'velocity': [0, 0]
+            'velocity': [0, 0],
+            'detection_confidence': detection_confidence
         }
 
         # Store features and timestamps
         self.person_features[new_id] = features
+        if color_features is not None:
+            self.person_color_features[new_id] = color_features
+            
         self.appearance_history[new_id] = [features]
+        if color_features is not None:
+            self.color_history[new_id] = [color_features]
+            
         self.person_timestamps[new_id] = {
             'first_appearance': frame_time,
             'last_appearance': frame_time
@@ -540,6 +955,12 @@ class PersonTracker:
         # Save features to disk
         self.save_person_features(new_id, features, frame_time)
         
+        # Initialize appearance count
+        self.appearance_counts[new_id] = 1
+        
+        # Initialize track confirmation counter
+        self.track_confirmations[new_id] = 1
+        
         return new_id
     
     def update_lost_tracks(self, matched_track_ids, frame_time):
@@ -551,18 +972,22 @@ class PersonTracker:
                 track_info['disappeared'] += 1
 
                 if track_info['disappeared'] > self.max_disappeared:
-                    # Move to lost tracks
-                    self.lost_tracks[track_id] = {
-                        'features': track_info['features'],
-                        'box': track_info['box'],
-                        'velocity': track_info.get('velocity', [0, 0]),
-                        'last_seen': track_info['last_seen']
-                    }
+                    # Only move to lost tracks if confirmed
+                    if self.track_confirmations[track_id] >= self.min_track_confirmations:
+                        # Move to lost tracks
+                        self.lost_tracks[track_id] = {
+                            'features': track_info['features'],
+                            'color_features': track_info.get('color_features'),
+                            'box': track_info['box'],
+                            'velocity': track_info.get('velocity', [0, 0]),
+                            'last_seen': track_info['last_seen']
+                        }
                     del self.active_tracks[track_id]
 
         # Remove expired lost tracks
         for track_id in list(self.lost_tracks.keys()):
-            if frame_time - self.lost_tracks[track_id]['last_seen'] > self.max_lost_age:
+            if 'merged_into' not in self.lost_tracks[track_id] and \
+               frame_time - self.lost_tracks[track_id]['last_seen'] > self.max_lost_age:
                 del self.lost_tracks[track_id]
     
     def save_person_image(self, track_id, frame):
@@ -596,10 +1021,10 @@ class PersonTracker:
                 str(feature_path),
                 features=features,
                 timestamp=frame_time,
-                video_name=self.video_name
+                video_name=self.video_name,
+                confirmations=self.track_confirmations[person_id],
+                appearance_count=self.appearance_counts[person_id]
             )
-            
-            print(f"Saved features for person {person_id} to {feature_path}")
             
             return feature_path
         except Exception as e:
@@ -609,47 +1034,88 @@ class PersonTracker:
             return None
     
     def update_tracks(self, frame, detections, frame_time):
-        """Update tracks with new detections, handling reentries."""
+        """Update tracks with new detections, handling reentries and occlusions."""
         current_boxes = []
         current_features = []
+        current_colors = []
+        current_confidences = []
+        
+        # First, detect occlusions and relationship between detection boxes
+        detection_boxes = [box for box, conf in detections if conf >= self.min_detection_confidence]
+        occlusion_matrix = np.zeros((len(detection_boxes), len(detection_boxes)))
+        
+        for i in range(len(detection_boxes)):
+            for j in range(len(detection_boxes)):
+                if i != j:
+                    is_occluded, score = self.detect_occlusion(detection_boxes[i], detection_boxes[j])
+                    occlusion_matrix[i, j] = score
 
+        # Update environment model with current frame
+        self.env_model.add_calibration_frame(frame)
+        
         # Process new detections
-        for box, conf in detections:
+        for idx, (box, conf) in enumerate(detections):
             if conf < self.min_detection_confidence:
                 continue
+
+            # Adjust confidence based on occlusion
+            if len(detection_boxes) > 1 and idx < len(occlusion_matrix):
+                occlusion_scores = occlusion_matrix[idx]
+                max_occlusion = np.max(occlusion_scores)
+                if max_occlusion > 0.6:  # Significantly occluded
+                    conf *= (1 - max_occlusion * 0.5)  # Reduce confidence based on occlusion
 
             # Convert box coordinates to integers and ensure they're within frame bounds
             x1, y1, x2, y2 = map(int, box)
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(self.frame_width, x2), min(self.frame_height, y2)
             
-            # Skip invalid boxes
-            if x2 <= x1 or y2 <= y1 or (x2 - x1) < 10 or (y2 - y1) < 10:
+            # Skip invalid boxes and very small detections
+            box_height = y2 - y1
+            if x2 <= x1 or y2 <= y1 or box_height < self.min_detection_height:
                 continue
                 
             person_crop = frame[y1:y2, x1:x2]
             if person_crop.size == 0:
                 continue
 
+            # Extract deep features
             features = self.extract_features(person_crop)
-            if features is not None:
-                current_boxes.append([x1, y1, x2, y2])
-                current_features.append(features)
+            if features is None:
+                continue
+                
+            # Extract color features
+            color_features = self.extract_color_features(person_crop)
+
+            current_boxes.append([x1, y1, x2, y2])
+            current_features.append(features)
+            current_colors.append(color_features if color_features is not None else np.zeros(64))
+            current_confidences.append(conf)
 
         # Match with active tracks first
         tracked_boxes = []
         tracked_features = []
+        tracked_colors = []
         tracked_ids = []
 
         for track_id, track_info in self.active_tracks.items():
             tracked_boxes.append(track_info['box'])
             tracked_features.append(track_info['features'])
+            
+            # Get color features if available
+            if 'color_features' in track_info and track_info['color_features'] is not None:
+                tracked_colors.append(track_info['color_features'])
+            elif track_id in self.person_color_features:
+                tracked_colors.append(self.person_color_features[track_id])
+            else:
+                tracked_colors.append(np.zeros(64))
+                
             tracked_ids.append(track_id)
 
         # Calculate similarity matrix for active tracks
         similarity_matrix = self.calculate_similarity_matrix(
-            current_features, current_boxes,
-            tracked_features, tracked_boxes
+            current_features, current_boxes, current_colors,
+            tracked_features, tracked_boxes, tracked_colors
         )
 
         # Perform matching with active tracks
@@ -674,6 +1140,7 @@ class PersonTracker:
                     track_id, 
                     current_boxes[detection_idx],
                     current_features[detection_idx],
+                    current_colors[detection_idx] if current_colors[detection_idx].any() else None,
                     frame_time,
                     frame
                 )
@@ -686,33 +1153,46 @@ class PersonTracker:
             # Try to recover lost track
             recovered_id = self.recover_lost_tracklet(
                 current_features[detection_idx],
+                current_colors[detection_idx] if detection_idx < len(current_colors) and current_colors[detection_idx].any() else None,
                 current_boxes[detection_idx],
                 frame_time
             )
 
             if recovered_id is not None:
                 # Reactivate recovered track
-                self.reactivate_track(
+                reactivated_id = self.reactivate_track(
                     recovered_id,
                     current_boxes[detection_idx],
                     current_features[detection_idx],
+                    current_colors[detection_idx] if detection_idx < len(current_colors) and current_colors[detection_idx].any() else None,
                     frame_time,
                     frame
                 )
-                matched_track_ids.add(recovered_id)
+                matched_track_ids.add(reactivated_id)
                 matched_detections.add(detection_idx)
             else:
-                # Create new track
+                # Create new track with confidence check
+                detection_conf = current_confidences[detection_idx]
                 new_id = self.create_new_track(
                     current_boxes[detection_idx],
                     current_features[detection_idx],
+                    current_colors[detection_idx] if detection_idx < len(current_colors) and current_colors[detection_idx].any() else None,
                     frame_time,
+                    detection_conf,
                     frame
                 )
-                matched_track_ids.add(new_id)
+                if new_id is not None:
+                    matched_track_ids.add(new_id)
 
         # Update lost tracks
         self.update_lost_tracks(matched_track_ids, frame_time)
+        
+        # Periodically cleanup and deduplicate tracks
+        if frame_time > self.last_cleanup_frame + self.cleanup_interval:
+            duplicates = self.find_duplicate_active_tracks(frame_time)
+            if duplicates:
+                self.merge_duplicate_tracks(duplicates)
+            self.last_cleanup_frame = frame_time
         
         return current_boxes, current_features
     
@@ -804,6 +1284,19 @@ class PersonTracker:
                             (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 
                             0.7, (0, 0, 255), 2)
                 
+                # Draw entry/exit zones if calibrated
+                if self.env_model.entry_exit_zones:
+                    for zone_name, zone in self.env_model.entry_exit_zones.items():
+                        x1 = int(zone[0] * self.frame_width)
+                        y1 = int(zone[1] * self.frame_height)
+                        x2 = int(zone[2] * self.frame_width)
+                        y2 = int(zone[3] * self.frame_height)
+                        
+                        zone_color = (255, 0, 0) if zone_name == "entry" else (0, 0, 255)
+                        cv2.rectangle(vis_frame, (x1, y1), (x2, y2), zone_color, 2)
+                        cv2.putText(vis_frame, zone_name, (x1, y1-5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, zone_color, 2)
+                
                 # Display or save
                 if visualize:
                     cv2.imshow(f'Camera {self.camera_id}', vis_frame)
@@ -821,17 +1314,34 @@ class PersonTracker:
             cv2.destroyAllWindows()
         pbar.close()
         
+        # Final cleanup of duplicate tracks
+        duplicates = self.find_duplicate_active_tracks(frame_time)
+        if duplicates:
+            self.merge_duplicate_tracks(duplicates)
+        
+        # Filter tracks with too few confirmations
+        confirmed_count = sum(1 for track_id in self.track_confirmations 
+                             if self.track_confirmations[track_id] >= self.min_track_confirmations)
+        
         print(f"Processed {processed_count} frames from {self.video_name}")
-        print(f"Found {self.next_id} unique individuals")
+        print(f"Found {self.next_id} potential individuals, {confirmed_count} confirmed")
         
         return self.save_tracking_results()
     
     def save_tracking_results(self):
         """Save tracking results and return summary."""
+        # Filter out tracks with too few confirmations
+        confirmed_tracks = {track_id: self.track_confirmations[track_id] 
+                           for track_id in self.track_confirmations 
+                           if self.track_confirmations[track_id] >= self.min_track_confirmations}
+        
+        # Count unique individuals
+        unique_count = len(confirmed_tracks)
+        
         results = {
             'video_name': self.video_name,
             'camera_id': self.camera_id,
-            'total_persons': self.next_id,
+            'total_persons': unique_count,  # Only count confirmed tracks
             'video_metadata': {
                 'width': self.frame_width,
                 'height': self.frame_height,
@@ -843,6 +1353,10 @@ class PersonTracker:
 
         # Ensure all features are saved to disk before returning results
         for person_id in self.person_timestamps.keys():
+            # Only include confirmed tracks
+            if person_id not in confirmed_tracks:
+                continue
+                
             # Calculate person duration
             first_appearance = self.person_timestamps[person_id]['first_appearance']
             last_appearance = self.person_timestamps[person_id]['last_appearance']
@@ -861,6 +1375,7 @@ class PersonTracker:
                 'first_appearance': first_appearance,
                 'last_appearance': last_appearance,
                 'duration': duration,
+                'confirmations': self.track_confirmations[person_id],
                 'features_path': str(feature_path),
                 'images_dir': str(self.images_dir / f"person_{person_id}")
             }
@@ -873,7 +1388,7 @@ class PersonTracker:
         return results
 
 class GlobalTracker:
-    """Tracks individuals across multiple cameras."""
+    """Tracks individuals across multiple cameras with enhanced cross-camera matching."""
     
     def __init__(self, config=None):
         """Initialize the global tracker."""
@@ -881,6 +1396,7 @@ class GlobalTracker:
         self.global_identities = {}  # Map camera-specific IDs to global IDs
         self.appearance_sequence = {}  # Track sequence of camera appearances
         self.feature_database = {}  # Store features for cross-camera matching
+        self.color_database = {}  # Store color features for cross-camera matching
         
         # Cross-camera matching parameters
         self.similarity_threshold = self.config.get('global_similarity_threshold', 0.75)
@@ -890,16 +1406,35 @@ class GlobalTracker:
         
         # Enhanced feature storage
         self.camera_appearances = defaultdict(list)  # Track appearances by camera
+        
+        # Enhanced cross-camera matching
+        self.feature_weight = self.config.get('global_feature_weight', 0.6)
+        self.color_weight = self.config.get('global_color_weight', 0.2)
+        self.temporal_weight = self.config.get('global_temporal_weight', 0.2)
+        
+        # Entry/exit zone enhancement
+        self.cam1_exit_to_cam2_entry_min_time = self.config.get('cam1_to_cam2_min_time', 1)  # Min time to go from cam1 to cam2
+        self.cam1_exit_to_cam2_entry_max_time = self.config.get('cam1_to_cam2_max_time', 30)  # Max time to go from cam1 to cam2
+        
+        # Global deduplication
+        self.global_mapping_cleanup_done = False
     
-    def register_camera_detection(self, camera_id, person_id, features, timestamp):
-        """Register a detection from a specific camera."""
-        global_id = self._match_or_create_global_id(camera_id, person_id, features, timestamp)
+    def register_camera_detection(self, camera_id, person_id, features, color_features=None, timestamp=0, confirmations=0, is_exit_zone=False):
+        """Register a detection from a specific camera with enhanced matching."""
+        # Skip registrations with too few confirmations
+        if confirmations < 3:  # Require at least 3 confirmations
+            return None
+            
+        global_id = self._match_or_create_global_id(
+            camera_id, person_id, features, color_features, timestamp, is_exit_zone
+        )
         
         camera_key = f"Camera_{camera_id}"
         self.camera_appearances[camera_key].append({
             'global_id': global_id,
             'camera_id': person_id,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'is_exit_zone': is_exit_zone
         })
         
         if global_id not in self.appearance_sequence:
@@ -911,11 +1446,14 @@ class GlobalTracker:
             self.appearance_sequence[global_id].append({
                 'camera': camera_key,
                 'timestamp': timestamp,
-                'camera_specific_id': person_id
+                'camera_specific_id': person_id,
+                'is_exit_zone': is_exit_zone
             })
+            
+        return global_id
     
-    def _match_or_create_global_id(self, camera_id, person_id, features, timestamp):
-        """Match with existing identity or create new global ID."""
+    def _match_or_create_global_id(self, camera_id, person_id, features, color_features, timestamp, is_exit_zone):
+        """Match with existing identity or create new global ID with enhanced matching."""
         camera_key = f"{camera_id}_{person_id}"
         
         # Check if we've seen this camera-specific ID before
@@ -936,15 +1474,22 @@ class GlobalTracker:
             last_timestamp = data['last_timestamp']
             last_camera = data['last_camera']
             
-            # Skip if temporal constraint is violated
+            # Skip if same camera (should be handled by single-camera tracker)
+            if camera_id == last_camera:
+                continue
+                
+            # Enhanced temporal constraints
             time_diff = abs(timestamp - last_timestamp)
-            if self.temporal_constraint:
+            
+            # Special case for Camera 1 to Camera 2 transition (assuming exit from 1, entry to 2)
+            if last_camera == CAMERA1_ID and camera_id == CAMERA2_ID:
+                # Person leaving camera 1 and entering camera 2
+                if not (self.cam1_exit_to_cam2_entry_min_time <= time_diff <= self.cam1_exit_to_cam2_entry_max_time):
+                    continue
+            # General case
+            elif self.temporal_constraint:
                 # Skip if time gap is too large or too small
                 if time_diff > self.max_time_gap or time_diff < self.min_time_gap:
-                    continue
-                    
-                # Skip if same camera (should be handled by single-camera tracker)
-                if camera_id == last_camera:
                     continue
                     
             # Ensure stored features are flattened and contiguous
@@ -952,35 +1497,165 @@ class GlobalTracker:
             if not stored_features_flat.flags['C_CONTIGUOUS']:
                 stored_features_flat = np.ascontiguousarray(stored_features_flat)
             
-            # Calculate feature similarity
-            similarity = 1 - distance.cosine(features_flat, stored_features_flat)
+            # Calculate feature similarity (deep features)
+            feature_similarity = 1 - distance.cosine(features_flat, stored_features_flat)
             
-            # Adjust similarity based on time gap (closer in time = higher score)
+            # Calculate color similarity if available
+            color_similarity = 0
+            if color_features is not None and global_id in self.color_database:
+                stored_color = self.color_database[global_id]
+                # Simple correlation measure for histogram comparison
+                color_similarity = np.sum(np.minimum(color_features, stored_color)) / np.sum(np.maximum(color_features, stored_color))
+            
+            # Calculate temporal similarity (closer in time = higher score, with max time difference normalization)
+            temporal_similarity = 1.0
             if self.temporal_constraint and time_diff <= self.max_time_gap:
                 # Apply temporal decay - similarity decreases as time gap increases
-                time_factor = 1.0 - (time_diff / self.max_time_gap) * 0.3
-                similarity = similarity * time_factor
+                temporal_similarity = 1.0 - (time_diff / self.max_time_gap)
             
+            # Combine similarities with weights
+            similarity = (
+                self.feature_weight * feature_similarity +
+                self.color_weight * color_similarity +
+                self.temporal_weight * temporal_similarity
+            )
+            
+            # Additional boost for expected transitions (e.g., exit zone of cam1 to entry zone of cam2)
+            if (last_camera == CAMERA1_ID and camera_id == CAMERA2_ID and 
+                data.get('is_exit_zone', False) and is_exit_zone):
+                similarity *= 1.2  # 20% boost for expected transition pattern
+                
             if similarity > self.similarity_threshold and similarity > best_score:
                 best_match = global_id
                 best_score = similarity
         
         if best_match is None:
             # Create new global identity
-            best_match = len(self.global_identities)
+            best_match = len(self.global_identities) // 2  # Normalize to account for both cameras
             
         # Update feature database
         self.feature_database[best_match] = {
             'features': features,
             'last_timestamp': timestamp,
-            'last_camera': camera_id
+            'last_camera': camera_id,
+            'is_exit_zone': is_exit_zone
         }
+            
+        # Update color database if available
+        if color_features is not None:
+            self.color_database[best_match] = color_features
             
         self.global_identities[camera_key] = best_match
         return best_match
     
+    def cleanup_global_mapping(self):
+        """Clean up and deduplicate global IDs to reduce overcounting."""
+        if self.global_mapping_cleanup_done:
+            return
+            
+        # Identify single-camera global IDs (individuals seen in only one camera)
+        camera1_only = set()
+        camera2_only = set()
+        seen_in_both = set()
+        
+        for global_id, appearances in self.appearance_sequence.items():
+            seen_cameras = set(app['camera'] for app in appearances)
+            
+            if len(seen_cameras) == 1:
+                camera = list(seen_cameras)[0]
+                if camera == f'Camera_{CAMERA1_ID}':
+                    camera1_only.add(global_id)
+                elif camera == f'Camera_{CAMERA2_ID}':
+                    camera2_only.add(global_id)
+            else:
+                seen_in_both.add(global_id)
+        
+        # Calculate similarities between global IDs in different cameras
+        potential_merges = []
+        
+        for id1 in camera1_only:
+            if id1 not in self.feature_database:
+                continue
+                
+            features1 = self.feature_database[id1]['features'].flatten()
+            color1 = self.color_database.get(id1)
+            
+            for id2 in camera2_only:
+                if id2 not in self.feature_database:
+                    continue
+                    
+                features2 = self.feature_database[id2]['features'].flatten()
+                color2 = self.color_database.get(id2)
+                
+                # Calculate feature similarity
+                feature_sim = 1 - distance.cosine(features1, features2)
+                
+                # Calculate color similarity if available
+                color_sim = 0
+                if color1 is not None and color2 is not None:
+                    color_sim = np.sum(np.minimum(color1, color2)) / np.sum(np.maximum(color1, color2))
+                
+                # Calculate timestamp difference
+                time1 = self.feature_database[id1]['last_timestamp']
+                time2 = self.feature_database[id2]['last_timestamp']
+                time_diff = abs(time1 - time2)
+                
+                # Only consider pairs within reasonable time difference
+                if self.cam1_exit_to_cam2_entry_min_time <= time_diff <= self.cam1_exit_to_cam2_entry_max_time:
+                    # Combined similarity
+                    similarity = (
+                        self.feature_weight * feature_sim +
+                        self.color_weight * color_sim
+                    )
+                    
+                    # Use a higher threshold for merging
+                    if similarity > 0.85:  # Stricter threshold for global merging
+                        potential_merges.append((id1, id2, similarity))
+        
+        # Sort potential merges by similarity (highest first)
+        potential_merges.sort(key=lambda x: x[2], reverse=True)
+        
+        # Apply merges (highest similarity matches first)
+        merged_ids = set()
+        
+        for id1, id2, similarity in potential_merges:
+            # Skip if either ID has already been merged
+            if id1 in merged_ids or id2 in merged_ids:
+                continue
+                
+            # Perform merge: remap all references of id2 to id1
+            for camera_key, global_id in list(self.global_identities.items()):
+                if global_id == id2:
+                    self.global_identities[camera_key] = id1
+            
+            # Update appearance sequence
+            if id2 in self.appearance_sequence:
+                if id1 not in self.appearance_sequence:
+                    self.appearance_sequence[id1] = []
+                    
+                self.appearance_sequence[id1].extend(self.appearance_sequence[id2])
+                del self.appearance_sequence[id2]
+            
+            # Mark as merged
+            merged_ids.add(id2)
+            seen_in_both.add(id1)  # Now id1 represents a person seen in both cameras
+            if id1 in camera1_only:
+                camera1_only.remove(id1)
+            if id2 in camera2_only:
+                camera2_only.remove(id2)
+        
+        # Update counts based on cleanup
+        self.camera1_count = len(camera1_only) + len(seen_in_both)
+        self.camera2_count = len(camera2_only) + len(seen_in_both)
+        self.total_count = len(camera1_only) + len(camera2_only) + len(seen_in_both)
+        
+        self.global_mapping_cleanup_done = True
+    
     def analyze_camera_transitions(self):
-        """Analyze transitions between cameras."""
+        """Analyze transitions between cameras with improved accuracy."""
+        # First, clean up global mapping to reduce overcounting
+        self.cleanup_global_mapping()
+        
         cam1_to_cam2 = 0
         cam2_to_cam1 = 0
         cam1_persons = set()
@@ -1002,31 +1677,62 @@ class GlobalTracker:
             if has_cam2:
                 cam2_persons.add(global_id)
         
-        # Count transitions
+        # Count transitions with improved temporal analysis
         for global_id, appearances in self.appearance_sequence.items():
+            # Skip if only seen in one camera
+            if global_id not in cam1_persons or global_id not in cam2_persons:
+                continue
+                
             # Sort appearances by timestamp
             sorted_appearances = sorted(appearances, key=lambda x: x['timestamp'])
             
-            # Check for sequential appearances
+            # Look for valid transitions within time constraints
             for i in range(len(sorted_appearances) - 1):
                 current = sorted_appearances[i]
                 next_app = sorted_appearances[i + 1]
                 
+                # Calculate time difference
+                time_diff = next_app['timestamp'] - current['timestamp']
+                
+                # Camera 1 to Camera 2 transition
                 if current['camera'] == f'Camera_{CAMERA1_ID}' and next_app['camera'] == f'Camera_{CAMERA2_ID}':
-                    cam1_to_cam2 += 1
+                    # Check if time difference is reasonable (between min and max allowed)
+                    if self.cam1_exit_to_cam2_entry_min_time <= time_diff <= self.cam1_exit_to_cam2_entry_max_time:
+                        # Additional check for exit/entry zone if available
+                        if current.get('is_exit_zone', False) or next_app.get('is_exit_zone', False):
+                            cam1_to_cam2 += 1
+                        else:
+                            # If no zone info, still count but with lower confidence
+                            cam1_to_cam2 += 1
+                
+                # Camera 2 to Camera 1 transition (using same logic)
                 elif current['camera'] == f'Camera_{CAMERA2_ID}' and next_app['camera'] == f'Camera_{CAMERA1_ID}':
-                    cam2_to_cam1 += 1
+                    if self.min_time_gap <= time_diff <= self.max_time_gap:
+                        if current.get('is_exit_zone', False) or next_app.get('is_exit_zone', False):
+                            cam2_to_cam1 += 1
+                        else:
+                            cam2_to_cam1 += 1
         
-        return {
-            'camera1_unique': len(cam1_persons),
-            'camera2_unique': len(cam2_persons),
-            'camera1_to_camera2': cam1_to_cam2,
-            'camera2_to_camera1': cam2_to_cam1,
-            'total_unique_individuals': len(self.global_identities) // 2 + 1  # Accounting for overlap
-        }
+        # Override counts with cleaned-up values
+        if hasattr(self, 'camera1_count') and hasattr(self, 'camera2_count') and hasattr(self, 'total_count'):
+            return {
+                'camera1_unique': self.camera1_count,
+                'camera2_unique': self.camera2_count,
+                'camera1_to_camera2': cam1_to_cam2,
+                'camera2_to_camera1': cam2_to_cam1,
+                'total_unique_individuals': self.total_count
+            }
+        else:
+            return {
+                'camera1_unique': len(cam1_persons),
+                'camera2_unique': len(cam2_persons),
+                'camera1_to_camera2': cam1_to_cam2,
+                'camera2_to_camera1': cam2_to_cam1,
+                'total_unique_individuals': len(self.global_identities) // 2 + 1  # Accounting for overlap
+            }
 
 def process_video_pair(video1_path, video2_path, output_dir, config=None, visualize=False, source_dir_name=None):
-    """Process a pair of videos from Camera 1 and Camera 2.
+    """Process a pair of videos from Camera 1 and Camera 2 with enhanced tracking.
     
     Args:
         video1_path: Path to Camera 1 video
@@ -1043,33 +1749,47 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     if config is None:
         config = {
             # Camera 1 parameters (more complex environment)
-            'cam1_min_confidence': 0.6,
-            'cam1_similarity_threshold': 0.65,
+            'cam1_min_confidence': 0.5,
+            'cam1_similarity_threshold': 0.6,
             'cam1_max_disappear_seconds': 3,
-            'cam1_feature_weight': 0.6, 
-            'cam1_position_weight': 0.2,
-            'cam1_motion_weight': 0.2,
-            'cam1_reentry_threshold': 0.7,
+            'cam1_feature_weight': 0.5,
+            'cam1_position_weight': 0.15,
+            'cam1_motion_weight': 0.15,
+            'cam1_color_weight': 0.2,
+            'cam1_reentry_threshold': 0.65,
+            'cam1_new_track_confidence': 0.7,
             
             # Camera 2 parameters (cleaner environment)
-            'cam2_min_confidence': 0.5,
-            'cam2_similarity_threshold': 0.7,
+            'cam2_min_confidence': 0.4,
+            'cam2_similarity_threshold': 0.65,
             'cam2_max_disappear_seconds': 2,
-            'cam2_feature_weight': 0.55,
-            'cam2_position_weight': 0.25,
-            'cam2_motion_weight': 0.2,
-            'cam2_reentry_threshold': 0.75,
+            'cam2_feature_weight': 0.45,
+            'cam2_position_weight': 0.2,
+            'cam2_motion_weight': 0.15,
+            'cam2_color_weight': 0.2,
+            'cam2_reentry_threshold': 0.7,
+            'cam2_new_track_confidence': 0.75,
             
-            # General parameters
-            'max_lost_seconds': 30,
-            'max_history_length': 10,
+            # Common tracking parameters
+            'max_lost_seconds': 15,  # Reduced from 30 to avoid overcounting
+            'max_history_length': 20,
             'process_every_nth_frame': 1,
+            'min_track_confirmations': 3,
+            'min_track_visibility': 0.7,
+            'min_detection_height': 60,  # Minimum detection height to be considered valid
             
             # Global tracking parameters
-            'global_similarity_threshold': 0.75,
+            'global_similarity_threshold': 0.8,  # Increased from 0.75
+            'global_feature_weight': 0.6,
+            'global_color_weight': 0.2,
+            'global_temporal_weight': 0.2,
             'temporal_constraint': True,
-            'max_time_gap': 600,  # 10 minutes
-            'min_time_gap': 1     # 1 second
+            'max_time_gap': 120,  # Reduced from 600 to 120 seconds (2 minutes)
+            'min_time_gap': 1,    # 1 second
+            
+            # Cross-camera transit times
+            'cam1_to_cam2_min_time': 2,   # Minimum time to go from camera 1 to camera 2
+            'cam1_to_cam2_max_time': 30  # Maximum time to go from camera 1 to camera 2
         }
     
     print("\n===== Loading models =====")
@@ -1130,6 +1850,11 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
                             print(f"Attempting to regenerate features from image: {img_path}")
                             img = cv2.imread(img_path)
                             if img is not None:
+                                # Extract color histogram
+                                color_extractor = ColorHistogramExtractor(bins=32)
+                                color_features = color_extractor.extract(img)
+                                
+                                # Preprocess for ReID
                                 img = cv2.resize(img, (128, 256))
                                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
                                 img = img.astype(np.float32) / 255.0
@@ -1138,109 +1863,32 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
                                 
                                 with torch.no_grad():
                                     features = reid_model(img)
-                                    features = features.cpu().numpy()
+                                    features = F.normalize(features, p=2, dim=1).cpu().numpy()
                                     
                                 # Save regenerated features
                                 os.makedirs(os.path.dirname(features_path), exist_ok=True)
                                 np.savez_compressed(features_path, 
                                                    features=features,
                                                    timestamp=person_data['first_appearance'],
-                                                   video_name=tracker1.video_name)
+                                                   video_name=tracker2.video_name,
+                                                   confirmations=person_data.get('confirmations', 0))
                                 print(f"Successfully regenerated and saved features for person {person_id}")
                                 
-                                global_tracker.register_camera_detection(
-                                    camera_id=CAMERA1_ID,
-                                    person_id=person_id,
-                                    features=features,
-                                    timestamp=person_data['first_appearance']
+                                # Check for entry zone
+                                is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
+                                    [0, 0, img.shape[2], img.shape[1]],  # Use full image as a fallback
+                                    tracker2.frame_width, 
+                                    tracker2.frame_height
                                 )
-                                continue
-                        except Exception as e:
-                            print(f"Error regenerating features: {e}")
-                
-                # Skip if couldn't regenerate
-                continue
-                
-            try:
-                features_data = np.load(features_path)
-                features = features_data['features']
-                timestamp = person_data['first_appearance']
-                
-                global_tracker.register_camera_detection(
-                    camera_id=CAMERA1_ID,
-                    person_id=person_id,
-                    features=features,
-                    timestamp=timestamp
-                )
-            except Exception as e:
-                print(f"Error loading features for Camera 1, person {person_id}: {e}")
-                continue
-            
-    except Exception as e:
-        print(f"Error processing Camera 1 video: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    
-    print("\n===== Processing Camera 2 =====")
-    # Process Camera 2 video
-    try:
-        tracker2 = PersonTracker(
-            video_path=video2_path,
-            output_dir=output_dir,  # Don't add source_dir_name again
-            detector=detector,
-            reid_model=reid_model,
-            device=device,
-            camera_id=CAMERA2_ID,
-            config=config
-        )
-        
-        results2 = tracker2.process_video(visualize=visualize)
-        
-        # Register detections with global tracker
-        for person_id, person_data in results2['persons'].items():
-            # Load features from the correct path
-            features_path = person_data['features_path']
-            
-            # Check if file exists before loading
-            if not os.path.exists(features_path):
-                print(f"Features file not found for Camera 2, person {person_id}: {features_path}")
-                
-                # Try to generate features from stored person images
-                person_dir = os.path.join(os.path.dirname(os.path.dirname(features_path)), 
-                                       "person_images", f"person_{person_id}")
-                if os.path.exists(person_dir):
-                    image_files = [f for f in os.listdir(person_dir) if f.endswith('.jpg')]
-                    if image_files:
-                        # Use the most recent image to generate features
-                        img_path = os.path.join(person_dir, image_files[-1])
-                        try:
-                            print(f"Attempting to regenerate features from image: {img_path}")
-                            img = cv2.imread(img_path)
-                            if img is not None:
-                                img = cv2.resize(img, (128, 256))
-                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
-                                img = img.astype(np.float32) / 255.0
-                                img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
-                                img = img.to(device)
-                                
-                                with torch.no_grad():
-                                    features = reid_model(img)
-                                    features = features.cpu().numpy()
-                                    
-                                # Save regenerated features
-                                os.makedirs(os.path.dirname(features_path), exist_ok=True)
-                                np.savez_compressed(features_path, 
-                                                   features=features,
-                                                   timestamp=person_data['first_appearance'],
-                                                   video_name=tracker2.video_name)
-                                print(f"Successfully regenerated and saved features for person {person_id}")
                                 
                                 global_tracker.register_camera_detection(
                                     camera_id=CAMERA2_ID,
                                     person_id=person_id,
                                     features=features,
-                                    timestamp=person_data['first_appearance']
+                                    color_features=color_features,
+                                    timestamp=person_data['first_appearance'],
+                                    confirmations=person_data.get('confirmations', 0),
+                                    is_exit_zone=is_in_entry_zone
                                 )
                                 continue
                         except Exception as e:
@@ -1253,12 +1901,28 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
                 features_data = np.load(features_path)
                 features = features_data['features']
                 timestamp = person_data['first_appearance']
+                confirmations = features_data.get('confirmations', person_data.get('confirmations', 0))
+                
+                # Check if this detection is in an entry zone (for better cross-camera matching)
+                is_in_entry_zone = tracker2.env_model.is_in_entry_zone(
+                    tracker2.active_tracks.get(int(person_id), {}).get('box', [0, 0, 0, 0]),
+                    tracker2.frame_width, 
+                    tracker2.frame_height
+                )
+                
+                # Create dummy color features if not available
+                color_features = None
+                if person_id in tracker2.person_color_features:
+                    color_features = tracker2.person_color_features[person_id]
                 
                 global_tracker.register_camera_detection(
                     camera_id=CAMERA2_ID,
                     person_id=person_id,
                     features=features,
-                    timestamp=timestamp
+                    color_features=color_features,
+                    timestamp=timestamp,
+                    confirmations=confirmations,
+                    is_exit_zone=is_in_entry_zone
                 )
             except Exception as e:
                 print(f"Error loading features for Camera 2, person {person_id}: {e}")
@@ -1270,7 +1934,8 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         traceback.print_exc()
         return None
     
-    # Analyze transitions
+    # Analyze transitions with enhanced accuracy
+    print("\n===== Analyzing Cross-Camera Transitions =====")
     analysis = global_tracker.analyze_camera_transitions()
     
     # Prepare summary
@@ -1295,7 +1960,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
         json.dump(summary, f, indent=4)
     
     # Print summary
-    print("\n===== Cross-Camera Analysis =====")
+    print("\n===== Cross-Camera Analysis Results =====")
     print(f"Camera 1 ({Path(video1_path).name}): {analysis['camera1_unique']} unique individuals")
     print(f"Camera 2 ({Path(video2_path).name}): {analysis['camera2_unique']} unique individuals")
     print(f"Transitions from Camera 1 to Camera 2: {analysis['camera1_to_camera2']}")
@@ -1453,20 +2118,22 @@ def setup_argparse():
                         help='Process every Nth frame (1 = process all frames)')
     
     # Camera-specific parameters
-    parser.add_argument('--cam1_conf', type=float, default=0.6,
+    parser.add_argument('--cam1_conf', type=float, default=0.5,
                         help='Camera 1 detection confidence threshold')
-    parser.add_argument('--cam2_conf', type=float, default=0.5,
+    parser.add_argument('--cam2_conf', type=float, default=0.4,
                         help='Camera 2 detection confidence threshold')
-    parser.add_argument('--cam1_sim', type=float, default=0.65,
+    parser.add_argument('--cam1_sim', type=float, default=0.6,
                         help='Camera 1 similarity threshold')
-    parser.add_argument('--cam2_sim', type=float, default=0.7,
+    parser.add_argument('--cam2_sim', type=float, default=0.65,
                         help='Camera 2 similarity threshold')
     
     # Global tracking parameters
-    parser.add_argument('--global_sim', type=float, default=0.75,
+    parser.add_argument('--global_sim', type=float, default=0.8,
                         help='Global tracker similarity threshold')
-    parser.add_argument('--max_time_gap', type=int, default=600,
+    parser.add_argument('--max_time_gap', type=int, default=120,
                         help='Maximum time gap (seconds) for cross-camera matching')
+    parser.add_argument('--track_min_conf', type=int, default=3,
+                        help='Minimum track confirmations to be considered valid')
     
     # Single pair processing
     parser.add_argument('--video1', type=str, default=None,
@@ -1502,30 +2169,44 @@ def main():
         'cam1_min_confidence': args.cam1_conf,
         'cam1_similarity_threshold': args.cam1_sim,
         'cam1_max_disappear_seconds': 3,
-        'cam1_feature_weight': 0.6, 
-        'cam1_position_weight': 0.2,
-        'cam1_motion_weight': 0.2,
-        'cam1_reentry_threshold': 0.7,
+        'cam1_feature_weight': 0.5,
+        'cam1_position_weight': 0.15,
+        'cam1_motion_weight': 0.15,
+        'cam1_color_weight': 0.2,
+        'cam1_reentry_threshold': 0.65,
+        'cam1_new_track_confidence': 0.7,
         
         # Camera 2 parameters (cleaner environment)
         'cam2_min_confidence': args.cam2_conf,
         'cam2_similarity_threshold': args.cam2_sim,
         'cam2_max_disappear_seconds': 2,
-        'cam2_feature_weight': 0.55,
-        'cam2_position_weight': 0.25,
-        'cam2_motion_weight': 0.2,
-        'cam2_reentry_threshold': 0.75,
+        'cam2_feature_weight': 0.45,
+        'cam2_position_weight': 0.2,
+        'cam2_motion_weight': 0.15,
+        'cam2_color_weight': 0.2,
+        'cam2_reentry_threshold': 0.7,
+        'cam2_new_track_confidence': 0.75,
         
-        # General parameters
-        'max_lost_seconds': 30,
-        'max_history_length': 10,
+        # Common tracking parameters
+        'max_lost_seconds': 15,  # Reduced from 30
+        'max_history_length': 20,
         'process_every_nth_frame': args.skip_frames,
+        'min_track_confirmations': args.track_min_conf,
+        'min_track_visibility': 0.7,
+        'min_detection_height': 60,
         
         # Global tracking parameters
         'global_similarity_threshold': args.global_sim,
+        'global_feature_weight': 0.6,
+        'global_color_weight': 0.2,
+        'global_temporal_weight': 0.2,
         'temporal_constraint': True,
         'max_time_gap': args.max_time_gap,
-        'min_time_gap': 1
+        'min_time_gap': 1,
+        
+        # Cross-camera transit times
+        'cam1_to_cam2_min_time': 2,
+        'cam1_to_cam2_max_time': 30
     }
     
     # Print configuration
@@ -1534,6 +2215,7 @@ def main():
     print(f"  Camera 2 confidence threshold: {config['cam2_min_confidence']}")
     print(f"  Processing every {config['process_every_nth_frame']} frame(s)")
     print(f"  Global similarity threshold: {config['global_similarity_threshold']}")
+    print(f"  Minimum track confirmations: {config['min_track_confirmations']}")
     
     # Process single pair or directory
     if args.video1 and args.video2:
