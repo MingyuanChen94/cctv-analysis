@@ -986,7 +986,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     # Load models
     try:
         # Load YOLO model
-        detector = YOLO("yolov8s.pt")
+        detector = YOLO("yolov12x.pt")
         detector.to(device)
         
         # Load ReID model
