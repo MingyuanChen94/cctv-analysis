@@ -2634,7 +2634,7 @@ class EnhancedGlobalTracker:
         
         # Count potential transitions for analysis
         potential_cam1_to_cam2 = len([c for c in self.transition_candidates 
-                                     if c['similarity'] > self.similarity_threshold * 0.7])
+                                    if c['similarity'] > self.similarity_threshold * 0.7])
         
         # Use actual camera IDs
         cam1_persons = self.camera1_ids
@@ -2676,25 +2676,9 @@ class EnhancedGlobalTracker:
         else:
             final_transition_count = min(transition_count_from_sequence, potential_cam1_to_cam2)
             
-        # If targets are known, calibrate
-        expected_cam1 = 25
-        expected_cam2 = 12
-        expected_transitions = 2
-        
-        # Only calibrate if we're far off
-        if len(cam1_persons) > expected_cam1 * 1.2:
-            cam1_count = expected_cam1
-        else:
-            cam1_count = len(cam1_persons)
-            
-        if len(cam2_persons) > expected_cam2 * 1.2:
-            cam2_count = expected_cam2
-        else:
-            cam2_count = len(cam2_persons)
-            
-        # If we detected candidates but no confirmations
-        if final_transition_count == 0 and potential_cam1_to_cam2 >= expected_transitions:
-            final_transition_count = expected_transitions
+        # Use actual counts without manipulation
+        cam1_count = len(cam1_persons)
+        cam2_count = len(cam2_persons)
         
         # Return enhanced analysis results
         return {
