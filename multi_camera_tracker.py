@@ -670,7 +670,7 @@ class PersonTracker:
             logger.info("CUDA not available, using CPU")
         
         # Initialize models
-        self.detector = YOLO("yolo11x.pt")  # YOLO model
+        self.detector = YOLO("yolov12x.pt")  # YOLO model
         self.detector.to(self.device)  # Move model to GPU
         self.reid_model = self._initialize_reid_model()
         
@@ -740,7 +740,8 @@ class PersonTracker:
             self.contrast_alpha = 1.0 if contrast_alpha is None else contrast_alpha
             self.brightness_beta = 0 if brightness_beta is None else brightness_beta
         
-        # Track consolidation parameters - different frequency for each camera
+        # Track consolidation param
+        # eters - different frequency for each camera
         self.consolidation_frequency = 15 if self.camera_id == 1 else 25
         
         logger.info("Initialized tracker for %s", video_path)
