@@ -670,7 +670,7 @@ class PersonTracker:
             logger.info("CUDA not available, using CPU")
         
         # Initialize models
-        self.detector = YOLO("yolov12x.pt")  # YOLO model
+        self.detector = YOLO("yolo12x.pt")  # YOLO model
         self.detector.to(self.device)  # Move model to GPU
         self.reid_model = self._initialize_reid_model()
         
