@@ -104,7 +104,8 @@ class PersonTracker:
         """
         self.video_path = Path(video_path)
         self.video_name = self.video_path.stem
-        self.camera_id = camera_id or self.video_name.split('_')[1] if '_' in self.video_name else None
+        # Extract camera ID from the filename - for Camera_1_YYYYMMDD format
+        self.camera_id = self.video_name.split('_')[1] if '_' in self.video_name else None
         
         # Set up output directories
         self.output_dir = Path(output_dir) / self.video_name
@@ -986,7 +987,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     # Load models
     try:
         # Load YOLO model
-        detector = YOLO("yolov12x.pt")
+        detector = YOLO("yolov8s.pt")
         detector.to(device)
         
         # Load ReID model
@@ -1132,21 +1133,25 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
         all_videos.extend(list(input_path.glob(f'*{ext}')))
     
     # Group videos by camera
-    cam1_videos = [v for v in all_videos if f"_Camera_{CAMERA1_ID}" in v.name]
-    cam2_videos = [v for v in all_videos if f"_Camera_{CAMERA2_ID}" in v.name]
+    cam1_videos = [v for v in all_videos if v.name.startswith(f"Camera_{CAMERA1_ID}_")]
+    cam2_videos = [v for v in all_videos if v.name.startswith(f"Camera_{CAMERA2_ID}_")]
     
     print(f"Found {len(cam1_videos)} Camera 1 videos and {len(cam2_videos)} Camera 2 videos")
     
-    # Create pairs based on matching names
+    # Create pairs based on matching date (YYYYMMDD part)
     video_pairs = []
     for cam1_video in cam1_videos:
-        # Get base name without camera part
-        base_name = cam1_video.name.split(f"_Camera_{CAMERA1_ID}")[0]
-        matching_cam2 = [v for v in cam2_videos if base_name in v.name]
-        
-        if matching_cam2:
-            video_pairs.append((cam1_video, matching_cam2[0]))
-    
+        # Extract date part (YYYYMMDD) from Camera_1_YYYYMMDD format
+        # First split by underscore to get ['Camera', '1', 'YYYYMMDD']
+        parts = cam1_video.stem.split('_')
+        if len(parts) >= 3:
+            date_part = parts[2]  # Get the date part
+            # Find matching Camera 2 video with same date
+            matching_cam2 = [v for v in cam2_videos if v.stem.split('_')[2] == date_part]
+            
+            if matching_cam2:
+                video_pairs.append((cam1_video, matching_cam2[0]))
+                
     print(f"Found {len(video_pairs)} video pairs to process")
     
     # Process each pair
@@ -1157,8 +1162,8 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
         print(f"Camera 2: {video2.name}")
         
         # Create pair-specific output directory under the source directory
-        pair_name = video1.stem.split('_Camera_')[0]
-        pair_output_dir = source_output_path / f"pair_{i+1}_{pair_name}"
+        date_part = video1.stem.split('_')[2]  # Get the YYYYMMDD part
+        pair_output_dir = source_output_path / f"pair_{date_part}"
         
         try:
             result = process_video_pair(
@@ -1172,7 +1177,7 @@ def process_directory(input_dir, output_dir, config=None, visualize=False):
             
             if result:
                 results.append({
-                    'pair_name': video1.stem.split('_Camera_')[0],
+                    'pair_name': video1.stem.split('_')[2],  # Use the date part as pair name
                     'camera1_video': video1.name,
                     'camera2_video': video2.name,
                     'camera1_count': result[0],
