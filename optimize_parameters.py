@@ -97,10 +97,9 @@ class BayesianOptimizer:
         # Parameter names for reference
         self.param_names = [param.name for param in self.param_space]
     
-    @use_named_args(dimensions=[])  # Will be updated in __init__
-    def objective_function(self, **params):
+    def objective_function_impl(self, **params):
         """
-        Objective function to be minimized.
+        Objective function implementation to be minimized.
         
         Args:
             **params: Parameter values from optimization
@@ -246,8 +245,10 @@ class BayesianOptimizer:
     
     def optimize(self):
         """Run the Bayesian optimization."""
-        # Update the objective function with the parameter space
-        self.objective_function.dimensions = self.param_space
+        # Create the decorated objective function with proper dimensions
+        @use_named_args(dimensions=self.param_space)
+        def objective(**params):
+            return self.objective_function_impl(**params)
         
         # Start optimization
         start_time = time.time()
@@ -257,7 +258,7 @@ class BayesianOptimizer:
         
         # Run Bayesian optimization
         result = gp_minimize(
-            self.objective_function,
+            objective,
             self.param_space,
             n_calls=self.n_calls,
             random_state=42,
