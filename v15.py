@@ -1032,7 +1032,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     # Load models
     try:
         # Load YOLO model
-        detector = YOLO("yolov12x.pt")
+        detector = YOLO("yolo12x.pt")
         detector.to(device)
         
         # Load ReID model
@@ -1268,7 +1268,7 @@ def download_models():
     # Check for YOLO
     try:
         # This will download the model if it doesn't exist
-        YOLO("yolov12x.pt")
+        YOLO("yolo12x.pt")
         print("YOLO model is available.")
     except Exception as e:
         print(f"Error checking YOLO model: {e}")
