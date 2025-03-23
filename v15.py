@@ -176,7 +176,7 @@ class PersonTracker:
                 return None  # Skip very small detections
                 
             img = cv2.resize(person_crop, (128, 256))
-            img = img[:, :, ::-1]  # BGR to RGB
+            img = img[:, :, ::-1].copy()  # BGR to RGB with copy to avoid negative strides
             img = torch.from_numpy(img).float()
             img = img.permute(2, 0, 1).unsqueeze(0) / 255.0  # Normalize to [0, 1]
             img = img.to(self.device)
@@ -987,7 +987,7 @@ def process_video_pair(video1_path, video2_path, output_dir, config=None, visual
     # Load models
     try:
         # Load YOLO model
-        detector = YOLO("yolov8s.pt")
+        detector = YOLO("yolov12x.pt")
         detector.to(device)
         
         # Load ReID model
@@ -1223,7 +1223,7 @@ def download_models():
     # Check for YOLO
     try:
         # This will download the model if it doesn't exist
-        YOLO("yolov8s.pt")
+        YOLO("yolov12x.pt")
         print("YOLO model is available.")
     except Exception as e:
         print(f"Error checking YOLO model: {e}")
