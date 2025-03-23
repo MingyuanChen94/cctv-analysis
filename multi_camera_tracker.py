@@ -2448,9 +2448,9 @@ def process_video_directory(input_dir, output_dir=None, params=None, target_valu
 def main():
     """Main function to run the video tracking and analysis."""
     parser = argparse.ArgumentParser(description="Multi-camera people tracking and counting")
-    parser.add_argument("--input", "-i", required=False, default='./videos',
+    parser.add_argument("--input", "-i", required=False, default='/home/mchen/Projects/VISIONARY/videos/test_data',
                         help="Directory containing camera videos")
-    parser.add_argument("--output", "-o", required=False, default='./results',
+    parser.add_argument("--output", "-o", required=False, default='/home/mchen/Projects/VISIONARY/results/',
                         help="Directory to store results")
     parser.add_argument("--optimize", "-p", action="store_true",
                         help="Run parameter optimization to match target values")
