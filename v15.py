@@ -175,18 +175,34 @@ class PersonTracker:
             if person_crop.shape[0] < 10 or person_crop.shape[1] < 10:
                 return None  # Skip very small detections
                 
+            # Make a copy of the crop to ensure contiguous memory
+            person_crop = person_crop.copy()
+            
+            # Resize image
             img = cv2.resize(person_crop, (128, 256))
-            img = img[:, :, ::-1].copy()  # BGR to RGB with copy to avoid negative strides
-            img = torch.from_numpy(img).float()
-            img = img.permute(2, 0, 1).unsqueeze(0) / 255.0  # Normalize to [0, 1]
+            
+            # Convert BGR to RGB and ensure contiguous array
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+            
+            # Normalize to [0, 1]
+            img = img.astype(np.float32) / 255.0
+            
+            # Convert to tensor (channels first)
+            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().unsqueeze(0)
+            
+            # Move to device
             img = img.to(self.device)
 
             # Extract features
             with torch.no_grad():
                 features = self.reid_model(img)
+                
             return features.cpu().numpy()
+            
         except Exception as e:
             print(f"Error extracting features: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def calculate_box_center(self, box):
@@ -309,10 +325,20 @@ class PersonTracker:
         if n_detections == 0 or n_tracks == 0:
             return np.array([])
 
+        # Ensure all feature arrays are contiguous for cosine distance calculation
+        current_features_flat = np.array([f.flatten() for f in current_features], dtype=np.float32)
+        tracked_features_flat = np.array([f.flatten() for f in tracked_features], dtype=np.float32)
+        
+        # Ensure both arrays are contiguous in memory
+        if not current_features_flat.flags['C_CONTIGUOUS']:
+            current_features_flat = np.ascontiguousarray(current_features_flat)
+        if not tracked_features_flat.flags['C_CONTIGUOUS']:
+            tracked_features_flat = np.ascontiguousarray(tracked_features_flat)
+
         # Calculate appearance similarity
         appearance_sim = 1 - distance.cdist(
-            np.array([f.flatten() for f in current_features]),
-            np.array([f.flatten() for f in tracked_features]),
+            current_features_flat,
+            tracked_features_flat,
             metric='cosine'
         )
 
@@ -367,6 +393,11 @@ class PersonTracker:
         best_match_id = None
         best_match_score = 0
 
+        # Ensure features are flattened and contiguous
+        features_flat = features.flatten()
+        if not features_flat.flags['C_CONTIGUOUS']:
+            features_flat = np.ascontiguousarray(features_flat)
+
         # Check recently lost tracks
         lost_tracks_to_remove = []
         for lost_id, lost_info in self.lost_tracks.items():
@@ -377,7 +408,11 @@ class PersonTracker:
 
             # Calculate appearance similarity
             lost_features = lost_info['features']
-            appearance_sim = 1 - distance.cosine(features.flatten(), lost_features.flatten())
+            lost_features_flat = lost_features.flatten()
+            if not lost_features_flat.flags['C_CONTIGUOUS']:
+                lost_features_flat = np.ascontiguousarray(lost_features_flat)
+                
+            appearance_sim = 1 - distance.cosine(features_flat, lost_features_flat)
 
             # Calculate position similarity based on predicted movement
             predicted_box = self.predict_next_position(
@@ -839,6 +874,11 @@ class GlobalTracker:
         if camera_key in self.global_identities:
             return self.global_identities[camera_key]
         
+        # Ensure features are flattened and contiguous
+        features_flat = features.flatten()
+        if not features_flat.flags['C_CONTIGUOUS']:
+            features_flat = np.ascontiguousarray(features_flat)
+            
         # Try to match with existing identities
         best_match = None
         best_score = 0
@@ -858,9 +898,14 @@ class GlobalTracker:
                 # Skip if same camera (should be handled by single-camera tracker)
                 if camera_id == last_camera:
                     continue
+                    
+            # Ensure stored features are flattened and contiguous
+            stored_features_flat = stored_features.flatten()
+            if not stored_features_flat.flags['C_CONTIGUOUS']:
+                stored_features_flat = np.ascontiguousarray(stored_features_flat)
             
             # Calculate feature similarity
-            similarity = 1 - distance.cosine(features.flatten(), stored_features.flatten())
+            similarity = 1 - distance.cosine(features_flat, stored_features_flat)
             
             # Adjust similarity based on time gap (closer in time = higher score)
             if self.temporal_constraint and time_diff <= self.max_time_gap:
